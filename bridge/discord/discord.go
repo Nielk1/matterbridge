@@ -3,13 +3,14 @@ package bdiscord
 import (
 	"bytes"
 	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/bwmarrin/discordgo"
-	"regexp"
-	"strings"
-	"sync"
 )
 
 type Bdiscord struct {
@@ -71,12 +72,21 @@ func (b *Bdiscord) Connect() error {
 		return err
 	}
 	b.Nick = userinfo.Username
-	for _, guild := range guilds {
-		if guild.Name == b.GetString("Server") {
-			b.Channels, err = b.c.GuildChannels(guild.ID)
-			b.guildID = guild.ID
-			if err != nil {
-				return err
+	serveridcheck := strings.Split(b.GetString("Server"), "ID:")
+	if len(serveridcheck) > 1 {
+		b.Channels, err = b.c.GuildChannels(serveridcheck[1])
+		b.guildID = serveridcheck[1]
+		if err != nil {
+			return err
+		}
+	} else {
+		for _, guild := range guilds {
+			if guild.Name == b.GetString("Server") {
+				b.Channels, err = b.c.GuildChannels(guild.ID)
+				b.guildID = guild.ID
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
