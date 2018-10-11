@@ -15,6 +15,7 @@ import (
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/42wim/matterbridge/matterhook"
 	"github.com/nlopes/slack"
+	"github.com/rs/xid"
 )
 
 type Bslack struct {
@@ -25,6 +26,7 @@ type Bslack struct {
 	Usergroups []slack.UserGroup
 	si         *slack.Info
 	channels   []slack.Channel
+	uuid       string
 	*bridge.Config
 	sync.RWMutex
 }
@@ -32,7 +34,7 @@ type Bslack struct {
 const messageDeleted = "message_deleted"
 
 func New(cfg *bridge.Config) bridge.Bridger {
-	return &Bslack{Config: cfg}
+	return &Bslack{Config: cfg, uuid: xid.New().String()}
 }
 
 func (b *Bslack) Command(cmd string) string {
@@ -177,7 +179,7 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 		np.IconURL = msg.Avatar
 	}
 	// add a callback ID so we can see we created it
-	np.Attachments = append(np.Attachments, slack.Attachment{CallbackID: "matterbridge_" + b.si.User.ID})
+	np.Attachments = append(np.Attachments, slack.Attachment{CallbackID: "matterbridge_" + b.uuid})
 	// add file attachments
 	np.Attachments = append(np.Attachments, b.createAttach(msg.Extra)...)
 	// add slack attachments (from another slack bridge)
@@ -355,7 +357,7 @@ func (b *Bslack) userGroupName(id string) string {
 
 // @see https://api.slack.com/docs/message-formatting#linking_to_channels_and_users
 func (b *Bslack) replaceMention(text string) string {
-	results := regexp.MustCompile(`<@([a-zA-z0-9]+)>`).FindAllStringSubmatch(text, -1)
+	results := regexp.MustCompile(`<@([a-zA-Z0-9]+)>`).FindAllStringSubmatch(text, -1)
 	for _, r := range results {
 		text = strings.Replace(text, "<@"+r[1]+">", "@"+b.userName(r[1]), -1)
 	}
@@ -571,6 +573,10 @@ func (b *Bslack) handleMessageEvent(ev *slack.MessageEvent) (*config.Message, er
 
 	// Only deleted messages can have a empty username and text
 	if (rmsg.Text == "" || rmsg.Username == "") && ev.SubType != messageDeleted {
+		// this is probably a webhook we couldn't resolve
+		if ev.BotID != "" {
+			return nil, fmt.Errorf("probably an incoming webhook we couldn't resolve (maybe ourselves)")
+		}
 		return nil, fmt.Errorf("empty message and not a deleted message")
 	}
 
@@ -604,7 +610,8 @@ func (b *Bslack) sendWebhook(msg config.Message) (string, error) {
 	if msg.Extra != nil {
 		// this sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			matterMessage := matterhook.OMessage{IconURL: b.GetString("IconURL"), Channel: msg.Channel, UserName: rmsg.Username, Text: rmsg.Text}
+			iconURL := config.GetIconURL(&rmsg, b.GetString("iconurl"))
+			matterMessage := matterhook.OMessage{IconURL: iconURL, Channel: msg.Channel, UserName: rmsg.Username, Text: rmsg.Text}
 			b.mh.Send(matterMessage)
 		}
 
@@ -627,7 +634,8 @@ func (b *Bslack) sendWebhook(msg config.Message) (string, error) {
 		}
 	}
 
-	matterMessage := matterhook.OMessage{IconURL: b.GetString("IconURL"), Attachments: attachs, Channel: msg.Channel, UserName: msg.Username, Text: msg.Text}
+	iconURL := config.GetIconURL(&msg, b.GetString("iconurl"))
+	matterMessage := matterhook.OMessage{IconURL: iconURL, Attachments: attachs, Channel: msg.Channel, UserName: msg.Username, Text: msg.Text}
 	if msg.Avatar != "" {
 		matterMessage.IconURL = msg.Avatar
 	}
@@ -657,7 +665,7 @@ func (b *Bslack) skipMessageEvent(ev *slack.MessageEvent) bool {
 
 	// skip messages we made ourselves
 	if len(ev.Attachments) > 0 {
-		if ev.Attachments[0].CallbackID == "matterbridge_"+b.si.User.ID {
+		if ev.Attachments[0].CallbackID == "matterbridge_"+b.uuid {
 			return true
 		}
 	}

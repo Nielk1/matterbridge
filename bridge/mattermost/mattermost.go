@@ -8,12 +8,14 @@ import (
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/42wim/matterbridge/matterclient"
 	"github.com/42wim/matterbridge/matterhook"
+	"github.com/rs/xid"
 	"strings"
 )
 
 type Bmattermost struct {
 	mh     *matterhook.Client
 	mc     *matterclient.MMClient
+	uuid   string
 	TeamID string
 	*bridge.Config
 	avatarMap map[string]string
@@ -21,6 +23,7 @@ type Bmattermost struct {
 
 func New(cfg *bridge.Config) bridge.Bridger {
 	b := &Bmattermost{Config: cfg, avatarMap: make(map[string]string)}
+	b.uuid = xid.New().String()
 	return b
 }
 
@@ -365,8 +368,9 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 	if msg.Extra != nil {
 		// this sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			matterMessage := matterhook.OMessage{IconURL: b.GetString("IconURL"), Channel: rmsg.Channel, UserName: rmsg.Username, Text: rmsg.Text, Props: make(map[string]interface{})}
-			matterMessage.Props["matterbridge_"+b.mc.User.Id] = true
+			iconURL := config.GetIconURL(&rmsg, b.GetString("iconurl"))
+			matterMessage := matterhook.OMessage{IconURL: iconURL, Channel: rmsg.Channel, UserName: rmsg.Username, Text: rmsg.Text, Props: make(map[string]interface{})}
+			matterMessage.Props["matterbridge_"+b.uuid] = true
 			b.mh.Send(matterMessage)
 		}
 
@@ -381,11 +385,12 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 		}
 	}
 
-	matterMessage := matterhook.OMessage{IconURL: b.GetString("IconURL"), Channel: msg.Channel, UserName: msg.Username, Text: msg.Text, Props: make(map[string]interface{})}
+	iconURL := config.GetIconURL(&msg, b.GetString("iconurl"))
+	matterMessage := matterhook.OMessage{IconURL: iconURL, Channel: msg.Channel, UserName: msg.Username, Text: msg.Text, Props: make(map[string]interface{})}
 	if msg.Avatar != "" {
 		matterMessage.IconURL = msg.Avatar
 	}
-	matterMessage.Props["matterbridge_"+b.mc.User.Id] = true
+	matterMessage.Props["matterbridge_"+b.uuid] = true
 	err := b.mh.Send(matterMessage)
 	if err != nil {
 		b.Log.Info(err)
@@ -415,7 +420,7 @@ func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 
 	// Ignore messages sent from matterbridge
 	if message.Post.Props != nil {
-		if _, ok := message.Post.Props["matterbridge_"+b.mc.User.Id].(bool); ok {
+		if _, ok := message.Post.Props["matterbridge_"+b.uuid].(bool); ok {
 			b.Log.Debugf("sent by matterbridge, ignoring")
 			return true
 		}

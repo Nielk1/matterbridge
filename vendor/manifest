@@ -402,7 +402,7 @@
 			"importpath": "github.com/matterbridge/go-xmpp",
 			"repository": "https://github.com/matterbridge/go-xmpp",
 			"vcs": "git",
-			"revision": "3cceb718219057817b66c4bb55673f5f417c0bff",
+			"revision": "cd19799fba91790ac733655c546bce2107e5b838",
 			"branch": "work",
 			"notests": true
 		},
@@ -657,6 +657,14 @@
 			"repository": "https://github.com/pkg/sftp",
 			"vcs": "git",
 			"revision": "fe27ce6214e6c0c5bae33b1144611e06ce10fc9a",
+			"branch": "master",
+			"notests": true
+		},
+		{
+			"importpath": "github.com/rs/xid",
+			"repository": "https://github.com/rs/xid",
+			"vcs": "git",
+			"revision": "088c5cf1423a6c8bd65110ddb12818e4ee993c84",
 			"branch": "master",
 			"notests": true
 		},
