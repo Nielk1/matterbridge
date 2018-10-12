@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
@@ -14,11 +15,13 @@ import (
 type Btelegram struct {
 	c *tgbotapi.BotAPI
 	*bridge.Config
-	avatarMap map[string]string // keep cache of userid and avatar sha
+	avatarMap    map[string]string // keep cache of userid and avatar sha
+	avatarTime   map[string]time.Time
+	avatarLastId map[string]string
 }
 
 func New(cfg *bridge.Config) bridge.Bridger {
-	return &Btelegram{Config: cfg, avatarMap: make(map[string]string)}
+	return &Btelegram{Config: cfg, avatarMap: make(map[string]string), avatarTime: make(map[string]time.Time), avatarLastId: make(map[string]string)}
 }
 
 func (b *Btelegram) Connect() error {
@@ -260,7 +263,7 @@ func (b *Btelegram) getFileDirectURL(id string) string {
 // logs an error message if it fails
 func (b *Btelegram) handleDownloadAvatar(userid int, channel string) {
 	rmsg := config.Message{Username: "system", Text: "avatar", Channel: channel, Account: b.Account, UserID: strconv.Itoa(userid), Event: config.EVENT_AVATAR_DOWNLOAD, Extra: make(map[string][]interface{})}
-	if _, ok := b.avatarMap[strconv.Itoa(userid)]; !ok {
+	if _, ok, timev, hastime := b.avatarMap[strconv.Itoa(userid)] b.avatarTime[strconv.Itoa(userid)]; !ok && (!hastime || time.Now().After(timev.Add(5*time.Duration(Mins)))) {
 		photos, err := b.c.GetUserProfilePhotos(tgbotapi.UserProfilePhotosConfig{UserID: userid, Limit: 1})
 		if err != nil {
 			b.Log.Errorf("Userprofile download failed for %#v %s", userid, err)
@@ -268,22 +271,26 @@ func (b *Btelegram) handleDownloadAvatar(userid int, channel string) {
 
 		if len(photos.Photos) > 0 {
 			photo := photos.Photos[0][0]
-			url := b.getFileDirectURL(photo.FileID)
-			name := strconv.Itoa(userid) + ".png"
-			b.Log.Debugf("trying to download %#v fileid %#v with size %#v", name, photo.FileID, photo.FileSize)
+			b.avatarTime[strconv.Itoa(userid)] = time.Now()
+			if b.avatarLastId[strconv.Itoa(userid)] != photo.FileID {
+				url := b.getFileDirectURL(photo.FileID)
+				name := strconv.Itoa(userid) + ".png"
+				b.Log.Debugf("trying to download %#v fileid %#v with size %#v", name, photo.FileID, photo.FileSize)
 
-			err := helper.HandleDownloadSize(b.Log, &rmsg, name, int64(photo.FileSize), b.General)
-			if err != nil {
-				b.Log.Error(err)
-				return
+				err := helper.HandleDownloadSize(b.Log, &rmsg, name, int64(photo.FileSize), b.General)
+				if err != nil {
+					b.Log.Error(err)
+					return
+				}
+				data, err := helper.DownloadFile(url)
+				if err != nil {
+					b.Log.Errorf("download %s failed %#v", url, err)
+					return
+				}
+				helper.HandleDownloadData(b.Log, &rmsg, name, rmsg.Text, "", data, b.General)
+				b.Remote <- rmsg
+				b.avatarLastId[strconv.Itoa(userid)] = photo.FileID
 			}
-			data, err := helper.DownloadFile(url)
-			if err != nil {
-				b.Log.Errorf("download %s failed %#v", url, err)
-				return
-			}
-			helper.HandleDownloadData(b.Log, &rmsg, name, rmsg.Text, "", data, b.General)
-			b.Remote <- rmsg
 		}
 	}
 }
