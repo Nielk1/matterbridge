@@ -164,6 +164,12 @@ func (b *Btelegram) handleRecv(updates <-chan tgbotapi.Update) {
 			if b.GetBool("UseFirstName") {
 				rmsg.Username = message.From.FirstName
 			}
+			if b.GetBool("UseLastName") {
+				if rmsg.Username != "" {
+					rmsg.Username += " "
+				}
+				rmsg.Username += message.From.LastName
+			}
 			if rmsg.Username == "" {
 				rmsg.Username = message.From.UserName
 				if rmsg.Username == "" {
