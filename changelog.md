@@ -1,3 +1,86 @@
+# v1.12.0
+
+## Breaking changes
+The slack bridge has been split in a `slack-legacy` and `slack` bridge.
+If you're still using `legacy tokens` and want to keep using them you'll have to rename `slack` to `slack-legacy` in your configuration. See [wiki](https://github.com/42wim/matterbridge/wiki/Section-Slack-(basic)#legacy-configuration) for more information.
+
+To migrate to the new bot-token based setup you can follow the instructions [here](https://github.com/42wim/matterbridge/wiki/Slack-bot-setup).
+
+Slack legacy tokens may be deprecated by Slack at short notice, so it is STRONGLY recommended to use a proper bot-token instead.
+
+## New features
+* general: New {GATEWAY} variable for `RemoteNickFormat` #501. See `RemoteNickFormat` in matterbridge.toml.sample.
+* general: New {CHANNEL} variable for `RemoteNickFormat` #515. See `RemoteNickFormat` in matterbridge.toml.sample.
+* general: Remove hyphens when auto-loading envvars from viper config #545
+* discord: You can mention discord-users from other bridges.
+* slack: Preserve threading between Slack instances #529. See `PreserveThreading` in matterbridge.toml.sample.
+* slack: Add ability to show when user is typing across Slack bridges #559
+* slack: Add rate-limiting
+* mattermost: Add support for mattermost [matterbridge plugin](https://github.com/matterbridge/mattermost-plugin)
+* api: Respond with message on connect. #550
+* api: Add a health endpoint to API #554
+
+## Bugfix
+* slack: Refactoring and making it better.
+* slack: Restore file comments coming from Slack. #583
+* irc: Fix IRC line splitting. #587
+* mattermost: Fix cookie and personal token behaviour. #530
+* mattermost: Check for expiring sessions and reconnect.
+
+
+## Contributors
+This release couldn't exist without the following contributors:
+@jheiselman, @NikkyAI, @dajohi, @NetwideRogue, @patcon and @Helcaraxan
+
+Special thanks to @Helcaraxan and @patcon for their work on improving/refactoring slack.
+
+# v1.11.3
+
+## Bugfix
+* mattermost: fix panic when using webhooks #491
+* slack: fix issues regarding API changes and lots of channels #489
+* irc: fix rejoin on kick problem #488
+
+# v1.11.2
+
+## Bugfix
+* slack: fix slack API changes regarding to files/images
+
+# v1.11.1
+
+## New features
+* slack: Add support for slack channels by ID. Closes #436
+* discord: Clip too long messages sent to discord (discord). Closes #440
+
+## Bugfix
+* general: fix possible panic on downloads that are too big #448
+* general: Fix avatar uploads to work with MediaDownloadPath. Closes #454
+* discord: allow receiving of topic changes/channel leave/joins from other bridges through the webhook
+* discord: Add a space before url in file uploads (discord). Closes #461
+* discord:  Skip empty messages being sent with the webhook (discord). #469
+* mattermost: Use nickname instead of username if defined (mattermost). Closes #452
+* irc: Stop numbers being stripped after non-color control codes (irc) (#465)
+* slack: Use UserID to look for avatar instead of username (slack). Closes #472
+
+# v1.11.0
+
+## New features
+* general: Add config option MediaDownloadPath (#443). See `MediaDownloadPath` in matterbridge.toml.sample
+* general: Add MediaDownloadBlacklist option. Closes #442. See `MediaDownloadBlacklist` in matterbridge.toml.sample
+* xmpp: Add channel password support for XMPP (#451)
+* xmpp: Add message correction support for XMPP (#437)
+* telegram: Add support for MessageFormat=htmlnick (telegram). #444
+* mattermost: Add support for mattermost 5.x
+
+## Enhancements
+* slack: Add Title from attachment slack message (#446)
+* irc: Prevent white or black color codes (irc) (#434)
+
+## Bugfix
+* slack: Fix regexp in replaceMention (slack). (#435)
+* irc: Reconnect on quit. (irc) See #431 (#445)
+* sshchat: Ignore messages from ourself. (sshchat) Closes #439
+
 # v1.10.1
 ## New features
 * irc: Colorize username sent to IRC using its crc32 IEEE checksum (#423). See `ColorNicks` in matterbridge.toml.sample

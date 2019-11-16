@@ -2,6 +2,7 @@ package bdiscord
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,12 +14,15 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+const MessageLength = 1950
+
 type Bdiscord struct {
 	c              *discordgo.Session
 	Channels       []*discordgo.Channel
 	Nick           string
 	UseChannelID   bool
 	userMemberMap  map[string]*discordgo.Member
+	nickMemberMap  map[string]*discordgo.Member
 	guildID        string
 	webhookID      string
 	webhookToken   string
@@ -30,6 +34,7 @@ type Bdiscord struct {
 func New(cfg *bridge.Config) bridge.Bridger {
 	b := &Bdiscord{Config: cfg}
 	b.userMemberMap = make(map[string]*discordgo.Member)
+	b.nickMemberMap = make(map[string]*discordgo.Member)
 	b.channelInfoMap = make(map[string]*config.ChannelInfo)
 	if b.GetString("WebhookURL") != "" {
 		b.Log.Debug("Configuring Discord Incoming Webhook")
@@ -93,6 +98,21 @@ func (b *Bdiscord) Connect() error {
 	for _, channel := range b.Channels {
 		b.Log.Debugf("found channel %#v", channel)
 	}
+	// obtaining guild members and initializing nickname mapping
+	b.Lock()
+	defer b.Unlock()
+	members, err := b.c.GuildMembers(b.guildID, "", 1000)
+	if err != nil {
+		b.Log.Error("Error obtaining guild members", err)
+		return err
+	}
+	for _, member := range members {
+		b.userMemberMap[member.User.ID] = member
+		b.nickMemberMap[member.User.Username] = member
+		if member.Nick != "" {
+			b.nickMemberMap[member.Nick] = member
+		}
+	}
 	return nil
 }
 
@@ -118,7 +138,7 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 	}
 
 	// Make a action /me of the message
-	if msg.Event == config.EVENT_USER_ACTION {
+	if msg.Event == config.EventUserAction {
 		msg.Text = "_" + msg.Text + "_"
 	}
 
@@ -136,16 +156,23 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 	// Use webhook to send the message
 	if wID != "" {
 		// skip events
-		if msg.Event != "" {
+		if msg.Event != "" && msg.Event != config.EventJoinLeave && msg.Event != config.EventTopicChange {
 			return "", nil
 		}
 		b.Log.Debugf("Broadcasting using Webhook")
 		for _, f := range msg.Extra["file"] {
 			fi := f.(config.FileInfo)
 			if fi.URL != "" {
-				msg.Text += fi.URL + " "
+				msg.Text += " " + fi.URL
 			}
 		}
+		// skip empty messages
+		if msg.Text == "" {
+			return "", nil
+		}
+
+		msg.Text = helper.ClipMessage(msg.Text, MessageLength)
+		msg.Text = b.replaceUserMentions(msg.Text)
 		err := b.c.WebhookExecute(
 			wID,
 			wToken,
@@ -161,7 +188,7 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 	b.Log.Debugf("Broadcasting using token (API)")
 
 	// Delete message
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		if msg.ID == "" {
 			return "", nil
 		}
@@ -172,6 +199,7 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 	// Upload a file if it exists
 	if msg.Extra != nil {
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
+			rmsg.Text = helper.ClipMessage(rmsg.Text, MessageLength)
 			b.c.ChannelMessageSend(channelID, rmsg.Username+rmsg.Text)
 		}
 		// check if we have files to upload (from slack, telegram or mattermost)
@@ -179,6 +207,9 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 			return b.handleUploadFile(&msg, channelID)
 		}
 	}
+
+	msg.Text = helper.ClipMessage(msg.Text, MessageLength)
+	msg.Text = b.replaceUserMentions(msg.Text)
 
 	// Edit message
 	if msg.ID != "" {
@@ -195,7 +226,7 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 }
 
 func (b *Bdiscord) messageDelete(s *discordgo.Session, m *discordgo.MessageDelete) {
-	rmsg := config.Message{Account: b.Account, ID: m.ID, Event: config.EVENT_MSG_DELETE, Text: config.EVENT_MSG_DELETE}
+	rmsg := config.Message{Account: b.Account, ID: m.ID, Event: config.EventMsgDelete, Text: config.EventMsgDelete}
 	rmsg.Channel = b.getChannelName(m.ChannelID)
 	if b.UseChannelID {
 		rmsg.Channel = "ID:" + m.ChannelID
@@ -212,7 +243,7 @@ func (b *Bdiscord) messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdat
 	// only when message is actually edited
 	if m.Message.EditedTimestamp != "" {
 		b.Log.Debugf("Sending edit message")
-		m.Content = m.Content + b.GetString("EditSuffix")
+		m.Content += b.GetString("EditSuffix")
 		b.messageCreate(s, (*discordgo.MessageCreate)(m))
 	}
 }
@@ -278,7 +309,7 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 	var ok bool
 	rmsg.Text, ok = b.replaceAction(rmsg.Text)
 	if ok {
-		rmsg.Event = config.EVENT_USER_ACTION
+		rmsg.Event = config.EventUserAction
 	}
 
 	b.Log.Debugf("<= Sending message from %s on %s to gateway", m.Author.Username, b.Account)
@@ -292,6 +323,10 @@ func (b *Bdiscord) memberUpdate(s *discordgo.Session, m *discordgo.GuildMemberUp
 		b.Log.Debugf("%s: memberupdate: user %s (nick %s) changes nick to %s", b.Account, m.Member.User.Username, b.userMemberMap[m.Member.User.ID].Nick, m.Member.Nick)
 	}
 	b.userMemberMap[m.Member.User.ID] = m.Member
+	b.nickMemberMap[m.Member.User.Username] = m.Member
+	if m.Member.Nick != "" {
+		b.nickMemberMap[m.Member.Nick] = m.Member
+	}
 	b.Unlock()
 }
 
@@ -320,6 +355,18 @@ func (b *Bdiscord) getNick(user *discordgo.User) string {
 		return b.userMemberMap[user.ID].Nick
 	}
 	return user.Username
+}
+
+func (b *Bdiscord) getGuildMemberByNick(nick string) (*discordgo.Member, error) {
+	b.Lock()
+	defer b.Unlock()
+	if _, ok := b.nickMemberMap[nick]; ok {
+		if b.nickMemberMap[nick] != nil {
+			return b.nickMemberMap[nick], nil
+		}
+	}
+
+	return nil, errors.New("Couldn't find guild member with nick " + nick) // This will most likely get ignored by the caller
 }
 
 func (b *Bdiscord) getChannelID(name string) string {
@@ -360,6 +407,34 @@ func (b *Bdiscord) replaceChannelMentions(text string) string {
 		}
 		return "#" + channel
 	})
+	return text
+}
+
+func (b *Bdiscord) replaceUserMentions(text string) string {
+	re := regexp.MustCompile("@[^@]{1,32}")
+	text = re.ReplaceAllStringFunc(text, func(m string) string {
+		mention := strings.TrimSpace(m[1:])
+		var member *discordgo.Member
+		var err error
+		for {
+			b.Log.Debugf("Testing mention: '%s'", mention)
+			member, err = b.getGuildMemberByNick(mention)
+			if err != nil {
+				lastSpace := strings.LastIndex(mention, " ")
+				if lastSpace == -1 {
+					break
+				}
+				mention = strings.TrimSpace(mention[0:lastSpace])
+			} else {
+				break
+			}
+		}
+		if err != nil {
+			return m
+		}
+		return strings.Replace(m, "@"+mention, member.User.Mention(), -1)
+	})
+	b.Log.Debugf("Message with mention replaced: %s", text)
 	return text
 }
 
@@ -422,9 +497,16 @@ func (b *Bdiscord) handleUploadFile(msg *config.Message, channelID string) (stri
 	var err error
 	for _, f := range msg.Extra["file"] {
 		fi := f.(config.FileInfo)
-		files := []*discordgo.File{}
-		files = append(files, &discordgo.File{fi.Name, "", bytes.NewReader(*fi.Data)})
-		_, err = b.c.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{Content: msg.Username + fi.Comment, Files: files})
+		file := discordgo.File{
+			Name:        fi.Name,
+			ContentType: "",
+			Reader:      bytes.NewReader(*fi.Data),
+		}
+		m := discordgo.MessageSend{
+			Content: msg.Username + fi.Comment,
+			Files:   []*discordgo.File{&file},
+		}
+		_, err = b.c.ChannelMessageSendComplex(channelID, &m)
 		if err != nil {
 			return "", fmt.Errorf("file upload failed: %#v", err)
 		}

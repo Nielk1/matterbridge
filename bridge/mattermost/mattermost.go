@@ -3,13 +3,15 @@ package bmattermost
 import (
 	"errors"
 	"fmt"
+	"strings"
+
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/42wim/matterbridge/matterclient"
 	"github.com/42wim/matterbridge/matterhook"
+	"github.com/mattermost/platform/model"
 	"github.com/rs/xid"
-	"strings"
 )
 
 type Bmattermost struct {
@@ -20,6 +22,8 @@ type Bmattermost struct {
 	*bridge.Config
 	avatarMap map[string]string
 }
+
+const mattermostPlugin = "mattermost.plugin"
 
 func New(cfg *bridge.Config) bridge.Bridger {
 	b := &Bmattermost{Config: cfg, avatarMap: make(map[string]string)}
@@ -32,25 +36,29 @@ func (b *Bmattermost) Command(cmd string) string {
 }
 
 func (b *Bmattermost) Connect() error {
+	if b.Account == mattermostPlugin {
+		return nil
+	}
 	if b.GetString("WebhookBindAddress") != "" {
-		if b.GetString("WebhookURL") != "" {
+		switch {
+		case b.GetString("WebhookURL") != "":
 			b.Log.Info("Connecting using webhookurl (sending) and webhookbindaddress (receiving)")
 			b.mh = matterhook.New(b.GetString("WebhookURL"),
 				matterhook.Config{InsecureSkipVerify: b.GetBool("SkipTLSVerify"),
 					BindAddress: b.GetString("WebhookBindAddress")})
-		} else if b.GetString("Token") != "" {
+		case b.GetString("Token") != "":
 			b.Log.Info("Connecting using token (sending)")
 			err := b.apiLogin()
 			if err != nil {
 				return err
 			}
-		} else if b.GetString("Login") != "" {
+		case b.GetString("Login") != "":
 			b.Log.Info("Connecting using login/password (sending)")
 			err := b.apiLogin()
 			if err != nil {
 				return err
 			}
-		} else {
+		default:
 			b.Log.Info("Connecting using webhookbindaddress (receiving)")
 			b.mh = matterhook.New(b.GetString("WebhookURL"),
 				matterhook.Config{InsecureSkipVerify: b.GetBool("SkipTLSVerify"),
@@ -59,7 +67,8 @@ func (b *Bmattermost) Connect() error {
 		go b.handleMatter()
 		return nil
 	}
-	if b.GetString("WebhookURL") != "" {
+	switch {
+	case b.GetString("WebhookURL") != "":
 		b.Log.Info("Connecting using webhookurl (sending)")
 		b.mh = matterhook.New(b.GetString("WebhookURL"),
 			matterhook.Config{InsecureSkipVerify: b.GetBool("SkipTLSVerify"),
@@ -80,14 +89,14 @@ func (b *Bmattermost) Connect() error {
 			go b.handleMatter()
 		}
 		return nil
-	} else if b.GetString("Token") != "" {
+	case b.GetString("Token") != "":
 		b.Log.Info("Connecting using token (sending and receiving)")
 		err := b.apiLogin()
 		if err != nil {
 			return err
 		}
 		go b.handleMatter()
-	} else if b.GetString("Login") != "" {
+	case b.GetString("Login") != "":
 		b.Log.Info("Connecting using login/password (sending and receiving)")
 		err := b.apiLogin()
 		if err != nil {
@@ -106,9 +115,12 @@ func (b *Bmattermost) Disconnect() error {
 }
 
 func (b *Bmattermost) JoinChannel(channel config.ChannelInfo) error {
+	if b.Account == mattermostPlugin {
+		return nil
+	}
 	// we can only join channels using the API
 	if b.GetString("WebhookURL") == "" && b.GetString("WebhookBindAddress") == "" {
-		id := b.mc.GetChannelId(channel.Name, "")
+		id := b.mc.GetChannelId(channel.Name, b.TeamID)
 		if id == "" {
 			return fmt.Errorf("Could not find channel ID for channel %s", channel.Name)
 		}
@@ -118,15 +130,18 @@ func (b *Bmattermost) JoinChannel(channel config.ChannelInfo) error {
 }
 
 func (b *Bmattermost) Send(msg config.Message) (string, error) {
+	if b.Account == mattermostPlugin {
+		return "", nil
+	}
 	b.Log.Debugf("=> Receiving %#v", msg)
 
 	// Make a action /me of the message
-	if msg.Event == config.EVENT_USER_ACTION {
+	if msg.Event == config.EventUserAction {
 		msg.Text = "*" + msg.Text + "*"
 	}
 
 	// map the file SHA to our user (caches the avatar)
-	if msg.Event == config.EVENT_AVATAR_DOWNLOAD {
+	if msg.Event == config.EventAvatarDownload {
 		return b.cacheAvatar(&msg)
 	}
 
@@ -136,7 +151,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 	}
 
 	// Delete message
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		if msg.ID == "" {
 			return "", nil
 		}
@@ -146,7 +161,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 	// Upload a file if it exists
 	if msg.Extra != nil {
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			b.mc.PostMessage(b.mc.GetChannelId(rmsg.Channel, ""), rmsg.Username+rmsg.Text)
+			b.mc.PostMessage(b.mc.GetChannelId(rmsg.Channel, b.TeamID), rmsg.Username+rmsg.Text)
 		}
 		if len(msg.Extra["file"]) > 0 {
 			return b.handleUploadFile(&msg)
@@ -164,7 +179,7 @@ func (b *Bmattermost) Send(msg config.Message) (string, error) {
 	}
 
 	// Post normal message
-	return b.mc.PostMessage(b.mc.GetChannelId(msg.Channel, ""), msg.Text)
+	return b.mc.PostMessage(b.mc.GetChannelId(msg.Channel, b.TeamID), msg.Text)
 }
 
 func (b *Bmattermost) handleMatter() {
@@ -186,7 +201,7 @@ func (b *Bmattermost) handleMatter() {
 		message.Account = b.Account
 		message.Text, ok = b.replaceAction(message.Text)
 		if ok {
-			message.Event = config.EVENT_USER_ACTION
+			message.Event = config.EventUserAction
 		}
 		b.Log.Debugf("<= Sending message from %s on %s to gateway", message.Username, b.Account)
 		b.Log.Debugf("<= Message is %#v", message)
@@ -204,7 +219,7 @@ func (b *Bmattermost) handleMatterClient(messages chan *config.Message) {
 		}
 
 		// only download avatars if we have a place to upload them (configured mediaserver)
-		if b.General.MediaServerUpload != "" {
+		if b.General.MediaServerUpload != "" || b.General.MediaDownloadPath != "" {
 			b.handleDownloadAvatar(message.UserID, message.Channel)
 		}
 
@@ -220,16 +235,28 @@ func (b *Bmattermost) handleMatterClient(messages chan *config.Message) {
 			}
 			if _, ok := props["attachments"].([]interface{}); ok {
 				rmsg.Extra["attachments"] = props["attachments"].([]interface{})
+				if rmsg.Text == "" {
+					for _, attachment := range rmsg.Extra["attachments"] {
+						attach := attachment.(map[string]interface{})
+						if attach["text"].(string) != "" {
+							rmsg.Text += attach["text"].(string)
+							continue
+						}
+						if attach["fallback"].(string) != "" {
+							rmsg.Text += attach["fallback"].(string)
+						}
+					}
+				}
 			}
 		}
 
 		// create a text for bridges that don't support native editing
-		if message.Raw.Event == "post_edited" && !b.GetBool("EditDisable") {
+		if message.Raw.Event == model.WEBSOCKET_EVENT_POST_EDITED && !b.GetBool("EditDisable") {
 			rmsg.Text = message.Text + b.GetString("EditSuffix")
 		}
 
-		if message.Raw.Event == "post_deleted" {
-			rmsg.Event = config.EVENT_MSG_DELETE
+		if message.Raw.Event == model.WEBSOCKET_EVENT_POST_DELETED {
+			rmsg.Event = config.EventMsgDelete
 		}
 
 		if len(message.Post.FileIds) > 0 {
@@ -240,6 +267,11 @@ func (b *Bmattermost) handleMatterClient(messages chan *config.Message) {
 				}
 			}
 		}
+		// Use nickname instead of username if defined
+		if nick := b.mc.GetNickName(rmsg.UserID); nick != "" {
+			rmsg.Username = nick
+		}
+
 		messages <- rmsg
 	}
 }
@@ -255,7 +287,7 @@ func (b *Bmattermost) handleMatterHook(messages chan *config.Message) {
 func (b *Bmattermost) apiLogin() error {
 	password := b.GetString("Password")
 	if b.GetString("Token") != "" {
-		password = "MMAUTHTOKEN=" + b.GetString("Token")
+		password = "token=" + b.GetString("Token")
 	}
 
 	b.mc = matterclient.New(b.GetString("Login"), password, b.GetString("Team"), b.GetString("Server"))
@@ -299,7 +331,7 @@ func (b *Bmattermost) cacheAvatar(msg *config.Message) (string, error) {
 // sends a EVENT_AVATAR_DOWNLOAD message to the gateway if successful.
 // logs an error message if it fails
 func (b *Bmattermost) handleDownloadAvatar(userid string, channel string) {
-	rmsg := config.Message{Username: "system", Text: "avatar", Channel: channel, Account: b.Account, UserID: userid, Event: config.EVENT_AVATAR_DOWNLOAD, Extra: make(map[string][]interface{})}
+	rmsg := config.Message{Username: "system", Text: "avatar", Channel: channel, Account: b.Account, UserID: userid, Event: config.EventAvatarDownload, Extra: make(map[string][]interface{})}
 	if _, ok := b.avatarMap[userid]; !ok {
 		data, resp := b.mc.Client.GetProfileImage(userid, "")
 		if resp.Error != nil {
@@ -339,7 +371,7 @@ func (b *Bmattermost) handleDownloadFile(rmsg *config.Message, id string) error 
 func (b *Bmattermost) handleUploadFile(msg *config.Message) (string, error) {
 	var err error
 	var res, id string
-	channelID := b.mc.GetChannelId(msg.Channel, "")
+	channelID := b.mc.GetChannelId(msg.Channel, b.TeamID)
 	for _, f := range msg.Extra["file"] {
 		fi := f.(config.FileInfo)
 		id, err = b.mc.UploadFile(*fi.Data, channelID, fi.Name)
@@ -368,6 +400,7 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 	if msg.Extra != nil {
 		// this sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
+			rmsg := rmsg // scopelint
 			iconURL := config.GetIconURL(&rmsg, b.GetString("iconurl"))
 			matterMessage := matterhook.OMessage{IconURL: iconURL, Channel: rmsg.Channel, UserName: rmsg.Username, Text: rmsg.Text, Props: make(map[string]interface{})}
 			matterMessage.Props["matterbridge_"+b.uuid] = true
@@ -409,12 +442,12 @@ func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 			return true
 		}
 		b.Log.Debugf("Sending JOIN_LEAVE event from %s to gateway", b.Account)
-		b.Remote <- config.Message{Username: "system", Text: message.Text, Channel: message.Channel, Account: b.Account, Event: config.EVENT_JOIN_LEAVE}
+		b.Remote <- config.Message{Username: "system", Text: message.Text, Channel: message.Channel, Account: b.Account, Event: config.EventJoinLeave}
 		return true
 	}
 
 	// Handle edited messages
-	if (message.Raw.Event == "post_edited") && b.GetBool("EditDisable") {
+	if (message.Raw.Event == model.WEBSOCKET_EVENT_POST_EDITED) && b.GetBool("EditDisable") {
 		return true
 	}
 
@@ -442,7 +475,7 @@ func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 	}
 
 	// only handle posted, edited or deleted events
-	if !(message.Raw.Event == "posted" || message.Raw.Event == "post_edited" || message.Raw.Event == "post_deleted") {
+	if !(message.Raw.Event == "posted" || message.Raw.Event == model.WEBSOCKET_EVENT_POST_EDITED || message.Raw.Event == model.WEBSOCKET_EVENT_POST_DELETED) {
 		return true
 	}
 	return false

@@ -2,23 +2,24 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
+	"sync"
+	"time"
+
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo/middleware"
 	"github.com/zfjagann/golang-ring"
-	"net/http"
-	"sync"
-	"time"
 )
 
-type Api struct {
+type API struct {
 	Messages ring.Ring
 	sync.RWMutex
 	*bridge.Config
 }
 
-type ApiMessage struct {
+type Message struct {
 	Text     string `json:"text"`
 	Username string `json:"username"`
 	UserID   string `json:"userid"`
@@ -27,17 +28,20 @@ type ApiMessage struct {
 }
 
 func New(cfg *bridge.Config) bridge.Bridger {
-	b := &Api{Config: cfg}
+	b := &API{Config: cfg}
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
 	b.Messages = ring.Ring{}
-	b.Messages.SetCapacity(b.GetInt("Buffer"))
+	if b.GetInt("Buffer") != 0 {
+		b.Messages.SetCapacity(b.GetInt("Buffer"))
+	}
 	if b.GetString("Token") != "" {
 		e.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
 			return key == b.GetString("Token"), nil
 		}))
 	}
+	e.GET("/api/health", b.handleHealthcheck)
 	e.GET("/api/messages", b.handleMessages)
 	e.GET("/api/stream", b.handleStream)
 	e.POST("/api/message", b.handlePostMessage)
@@ -51,30 +55,34 @@ func New(cfg *bridge.Config) bridge.Bridger {
 	return b
 }
 
-func (b *Api) Connect() error {
+func (b *API) Connect() error {
 	return nil
 }
-func (b *Api) Disconnect() error {
-	return nil
-
-}
-func (b *Api) JoinChannel(channel config.ChannelInfo) error {
+func (b *API) Disconnect() error {
 	return nil
 
 }
+func (b *API) JoinChannel(channel config.ChannelInfo) error {
+	return nil
 
-func (b *Api) Send(msg config.Message) (string, error) {
+}
+
+func (b *API) Send(msg config.Message) (string, error) {
 	b.Lock()
 	defer b.Unlock()
 	// ignore delete messages
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		return "", nil
 	}
 	b.Messages.Enqueue(&msg)
 	return "", nil
 }
 
-func (b *Api) handlePostMessage(c echo.Context) error {
+func (b *API) handleHealthcheck(c echo.Context) error {
+	return c.String(http.StatusOK, "OK")
+}
+
+func (b *API) handlePostMessage(c echo.Context) error {
 	message := config.Message{}
 	if err := c.Bind(&message); err != nil {
 		return err
@@ -90,7 +98,7 @@ func (b *Api) handlePostMessage(c echo.Context) error {
 	return c.JSON(http.StatusOK, message)
 }
 
-func (b *Api) handleMessages(c echo.Context) error {
+func (b *API) handleMessages(c echo.Context) error {
 	b.Lock()
 	defer b.Unlock()
 	c.JSONPretty(http.StatusOK, b.Messages.Values(), " ")
@@ -98,9 +106,17 @@ func (b *Api) handleMessages(c echo.Context) error {
 	return nil
 }
 
-func (b *Api) handleStream(c echo.Context) error {
+func (b *API) handleStream(c echo.Context) error {
 	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	c.Response().WriteHeader(http.StatusOK)
+	greet := config.Message{
+		Event:     config.EventAPIConnected,
+		Timestamp: time.Now(),
+	}
+	if err := json.NewEncoder(c.Response()).Encode(greet); err != nil {
+		return err
+	}
+	c.Response().Flush()
 	closeNotifier := c.Response().CloseNotify()
 	for {
 		select {

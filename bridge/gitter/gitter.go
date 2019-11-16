@@ -2,11 +2,12 @@ package bgitter
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/42wim/go-gitter"
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/bridge/helper"
-	"strings"
 )
 
 type Bgitter struct {
@@ -76,7 +77,7 @@ func (b *Bgitter) JoinChannel(channel config.ChannelInfo) error {
 						Account: b.Account, Avatar: b.getAvatar(ev.Message.From.Username), UserID: ev.Message.From.ID,
 						ID: ev.Message.ID}
 					if strings.HasPrefix(ev.Message.Text, "@"+ev.Message.From.Username) {
-						rmsg.Event = config.EVENT_USER_ACTION
+						rmsg.Event = config.EventUserAction
 						rmsg.Text = strings.Replace(rmsg.Text, "@"+ev.Message.From.Username+" ", "", -1)
 					}
 					b.Log.Debugf("<= Message is %#v", rmsg)
@@ -99,7 +100,7 @@ func (b *Bgitter) Send(msg config.Message) (string, error) {
 	}
 
 	// Delete message
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		if msg.ID == "" {
 			return "", nil
 		}

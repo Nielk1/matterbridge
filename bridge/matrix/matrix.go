@@ -3,14 +3,15 @@ package bmatrix
 import (
 	"bytes"
 	"fmt"
-	"github.com/42wim/matterbridge/bridge"
-	"github.com/42wim/matterbridge/bridge/config"
-	"github.com/42wim/matterbridge/bridge/helper"
-	matrix "github.com/matterbridge/gomatrix"
 	"mime"
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/42wim/matterbridge/bridge"
+	"github.com/42wim/matterbridge/bridge/config"
+	"github.com/42wim/matterbridge/bridge/helper"
+	matrix "github.com/matterbridge/gomatrix"
 )
 
 type Bmatrix struct {
@@ -71,9 +72,12 @@ func (b *Bmatrix) Send(msg config.Message) (string, error) {
 	b.Log.Debugf("Channel %s maps to channel id %s", msg.Channel, channel)
 
 	// Make a action /me of the message
-	if msg.Event == config.EVENT_USER_ACTION {
-		resp, err := b.mc.SendMessageEvent(channel, "m.room.message",
-			matrix.TextMessage{"m.emote", msg.Username + msg.Text})
+	if msg.Event == config.EventUserAction {
+		m := matrix.TextMessage{
+			MsgType: "m.emote",
+			Body:    msg.Username + msg.Text,
+		}
+		resp, err := b.mc.SendMessageEvent(channel, "m.room.message", m)
 		if err != nil {
 			return "", err
 		}
@@ -81,7 +85,7 @@ func (b *Bmatrix) Send(msg config.Message) (string, error) {
 	}
 
 	// Delete message
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		if msg.ID == "" {
 			return "", nil
 		}
@@ -125,7 +129,7 @@ func (b *Bmatrix) getRoomID(channel string) string {
 	return ""
 }
 
-func (b *Bmatrix) handlematrix() error {
+func (b *Bmatrix) handlematrix() {
 	syncer := b.mc.Syncer.(*matrix.DefaultSyncer)
 	syncer.OnEventType("m.room.redaction", b.handleEvent)
 	syncer.OnEventType("m.room.message", b.handleEvent)
@@ -136,7 +140,6 @@ func (b *Bmatrix) handlematrix() error {
 			}
 		}
 	}()
-	return nil
 }
 
 func (b *Bmatrix) handleEvent(ev *matrix.Event) {
@@ -157,7 +160,8 @@ func (b *Bmatrix) handleEvent(ev *matrix.Event) {
 
 		// Text must be a string
 		if rmsg.Text, ok = ev.Content["body"].(string); !ok {
-			b.Log.Errorf("Content[body] wasn't a %T ?", rmsg.Text)
+			b.Log.Errorf("Content[body] is not a string: %T\n%#v",
+				ev.Content["body"], ev.Content)
 			return
 		}
 
@@ -169,16 +173,16 @@ func (b *Bmatrix) handleEvent(ev *matrix.Event) {
 
 		// Delete event
 		if ev.Type == "m.room.redaction" {
-			rmsg.Event = config.EVENT_MSG_DELETE
+			rmsg.Event = config.EventMsgDelete
 			rmsg.ID = ev.Redacts
-			rmsg.Text = config.EVENT_MSG_DELETE
+			rmsg.Text = config.EventMsgDelete
 			b.Remote <- rmsg
 			return
 		}
 
 		// Do we have a /me action
 		if ev.Content["msgtype"].(string) == "m.emote" {
-			rmsg.Event = config.EVENT_USER_ACTION
+			rmsg.Event = config.EventUserAction
 		}
 
 		// Do we have attachments
@@ -230,11 +234,11 @@ func (b *Bmatrix) handleDownloadFile(rmsg *config.Message, content map[string]in
 		if msgtype == "m.image" {
 			mext, _ := mime.ExtensionsByType(mtype)
 			if len(mext) > 0 {
-				name = name + mext[0]
+				name += mext[0]
 			}
 		} else {
 			// just a default .png extension if we don't have mime info
-			name = name + ".png"
+			name += ".png"
 		}
 	}
 

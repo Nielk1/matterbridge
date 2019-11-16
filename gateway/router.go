@@ -2,25 +2,32 @@ package gateway
 
 import (
 	"fmt"
+	"time"
+
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
-	"github.com/42wim/matterbridge/gateway/samechannel"
-	//	"github.com/davecgh/go-spew/spew"
-	"time"
+	samechannelgateway "github.com/42wim/matterbridge/gateway/samechannel"
 )
 
 type Router struct {
-	Gateways map[string]*Gateway
-	Message  chan config.Message
-	*config.Config
+	config.Config
+
+	Gateways         map[string]*Gateway
+	Message          chan config.Message
+	MattermostPlugin chan config.Message
 }
 
-func NewRouter(cfg *config.Config) (*Router, error) {
-	r := &Router{Message: make(chan config.Message), Gateways: make(map[string]*Gateway), Config: cfg}
+func NewRouter(cfg config.Config) (*Router, error) {
+	r := &Router{
+		Config:           cfg,
+		Message:          make(chan config.Message),
+		MattermostPlugin: make(chan config.Message),
+		Gateways:         make(map[string]*Gateway),
+	}
 	sgw := samechannelgateway.New(cfg)
 	gwconfigs := sgw.GetConfig()
 
-	for _, entry := range append(gwconfigs, cfg.Gateway...) {
+	for _, entry := range append(gwconfigs, cfg.BridgeValues().Gateway...) {
 		if !entry.Enable {
 			continue
 		}
@@ -69,7 +76,8 @@ func (r *Router) getBridge(account string) *bridge.Bridge {
 
 func (r *Router) handleReceive() {
 	for msg := range r.Message {
-		if msg.Event == config.EVENT_FAILURE {
+		msg := msg // scopelint
+		if msg.Event == config.EventFailure {
 		Loop:
 			for _, gw := range r.Gateways {
 				for _, br := range gw.Bridges {
@@ -80,7 +88,7 @@ func (r *Router) handleReceive() {
 				}
 			}
 		}
-		if msg.Event == config.EVENT_REJOIN_CHANNELS {
+		if msg.Event == config.EventRejoinChannels {
 			for _, gw := range r.Gateways {
 				for _, br := range gw.Bridges {
 					if msg.Account == br.Account {
@@ -101,8 +109,8 @@ func (r *Router) handleReceive() {
 					msgIDs = append(msgIDs, gw.handleMessage(msg, br)...)
 				}
 				// only add the message ID if it doesn't already exists
-				if _, ok := gw.Messages.Get(msg.ID); !ok && msg.ID != "" {
-					gw.Messages.Add(msg.ID, msgIDs)
+				if _, ok := gw.Messages.Get(msg.Protocol + " " + msg.ID); !ok && msg.ID != "" {
+					gw.Messages.Add(msg.Protocol+" "+msg.ID, msgIDs)
 				}
 			}
 		}

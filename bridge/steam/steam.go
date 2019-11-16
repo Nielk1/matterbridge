@@ -2,6 +2,9 @@ package bsteam
 
 import (
 	"fmt"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
@@ -9,10 +12,6 @@ import (
 	"github.com/Philipp15b/go-steam"
 	"github.com/Philipp15b/go-steam/protocol/steamlang"
 	"github.com/Philipp15b/go-steam/steamid"
-	//"io/ioutil"
-	"strconv"
-	"sync"
-	"time"
 )
 
 type Bsteam struct {
@@ -61,7 +60,7 @@ func (b *Bsteam) JoinChannel(channel config.ChannelInfo) error {
 
 func (b *Bsteam) Send(msg config.Message) (string, error) {
 	// ignore delete messages
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		return "", nil
 	}
 	id, err := steamid.NewId(msg.Channel)
@@ -173,8 +172,6 @@ func (b *Bsteam) handleEvents() {
 			b.Log.Info("Attempting to reconnect...")
 			b.c.Connect()
 		case steam.FatalErrorEvent:
-			b.Log.Error(e)
-		case error:
 			b.Log.Error(e)
 		default:
 			b.Log.Debugf("unknown event %#v", e)

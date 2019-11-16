@@ -4,14 +4,6 @@ import (
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"github.com/42wim/matterbridge/bridge"
-	"github.com/42wim/matterbridge/bridge/config"
-	"github.com/42wim/matterbridge/bridge/helper"
-	"github.com/dfordsoft/golib/ic"
-	"github.com/lrstanley/girc"
-	"github.com/paulrosania/go-charset/charset"
-	_ "github.com/paulrosania/go-charset/data"
-	"github.com/saintfish/chardet"
 	"hash/crc32"
 	"io"
 	"io/ioutil"
@@ -21,7 +13,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
+
+	"github.com/42wim/matterbridge/bridge"
+	"github.com/42wim/matterbridge/bridge/config"
+	"github.com/42wim/matterbridge/bridge/helper"
+	"github.com/dfordsoft/golib/ic"
+	"github.com/lrstanley/girc"
+	"github.com/paulrosania/go-charset/charset"
+	"github.com/saintfish/chardet"
+
+	// We need to import the 'data' package as an implicit dependency.
+	// See: https://godoc.org/github.com/paulrosania/go-charset/charset
+	_ "github.com/paulrosania/go-charset/data"
 )
 
 type Birc struct {
@@ -62,8 +65,7 @@ func New(cfg *bridge.Config) bridge.Bridger {
 }
 
 func (b *Birc) Command(msg *config.Message) string {
-	switch msg.Text {
-	case "!users":
+	if msg.Text == "!users" {
 		b.i.Handlers.Add(girc.RPL_NAMREPLY, b.storeNames)
 		b.i.Handlers.Add(girc.RPL_ENDOFNAMES, b.endNames)
 		b.i.Cmd.SendRaw("NAMES " + msg.Channel)
@@ -105,7 +107,10 @@ func (b *Birc) Connect() error {
 	})
 
 	if b.GetBool("UseSASL") {
-		i.Config.SASL = &girc.SASLPlain{b.GetString("NickServNick"), b.GetString("NickServPassword")}
+		i.Config.SASL = &girc.SASLPlain{
+			User: b.GetString("NickServNick"),
+			Pass: b.GetString("NickServPassword"),
+		}
 	}
 
 	i.Handlers.Add(girc.RPL_WELCOME, b.handleNewConnection)
@@ -114,18 +119,19 @@ func (b *Birc) Connect() error {
 	go func() {
 		for {
 			if err := i.Connect(); err != nil {
-				b.Log.Errorf("error: %s", err)
-				b.Log.Info("reconnecting in 30 seconds...")
-				time.Sleep(30 * time.Second)
-				i.Handlers.Clear(girc.RPL_WELCOME)
-				i.Handlers.Add(girc.RPL_WELCOME, func(client *girc.Client, event girc.Event) {
-					b.Remote <- config.Message{Username: "system", Text: "rejoin", Channel: "", Account: b.Account, Event: config.EVENT_REJOIN_CHANNELS}
-					// set our correct nick on reconnect if necessary
-					b.Nick = event.Source.Name
-				})
+				b.Log.Errorf("disconnect: error: %s", err)
 			} else {
-				return
+				b.Log.Info("disconnect: client requested quit")
 			}
+
+			b.Log.Info("reconnecting in 30 seconds...")
+			time.Sleep(30 * time.Second)
+			i.Handlers.Clear(girc.RPL_WELCOME)
+			i.Handlers.Add(girc.RPL_WELCOME, func(client *girc.Client, event girc.Event) {
+				b.Remote <- config.Message{Username: "system", Text: "rejoin", Channel: "", Account: b.Account, Event: config.EventRejoinChannels}
+				// set our correct nick on reconnect if necessary
+				b.Nick = event.Source.Name
+			})
 		}
 	}()
 	b.i = i
@@ -161,7 +167,7 @@ func (b *Birc) JoinChannel(channel config.ChannelInfo) error {
 
 func (b *Birc) Send(msg config.Message) (string, error) {
 	// ignore delete messages
-	if msg.Event == config.EVENT_MSG_DELETE {
+	if msg.Event == config.EventMsgDelete {
 		return "", nil
 	}
 
@@ -218,25 +224,23 @@ func (b *Birc) Send(msg config.Message) (string, error) {
 		}
 	}
 
-	// split long messages on messageLength, to avoid clipped messages #281
+	var msgLines []string
 	if b.GetBool("MessageSplit") {
-		msg.Text = helper.SplitStringLength(msg.Text, b.MessageLength)
+		msgLines = helper.GetSubLines(msg.Text, b.MessageLength)
+	} else {
+		msgLines = helper.GetSubLines(msg.Text, 0)
 	}
-	for _, text := range strings.Split(msg.Text, "\n") {
-		if len(text) > b.MessageLength {
-			text = text[:b.MessageLength-len(" <message clipped>")]
-			if r, size := utf8.DecodeLastRuneInString(text); r == utf8.RuneError {
-				text = text[:len(text)-size]
-			}
-			text += " <message clipped>"
-		}
-		if len(b.Local) < b.MessageQueue {
-			if len(b.Local) == b.MessageQueue-1 {
-				text = text + " <message clipped>"
-			}
-			b.Local <- config.Message{Text: text, Username: msg.Username, Channel: msg.Channel, Event: msg.Event}
-		} else {
+	for i := range msgLines {
+		if len(b.Local) >= b.MessageQueue {
 			b.Log.Debugf("flooding, dropping message (queue at %d)", len(b.Local))
+			return "", nil
+		}
+
+		b.Local <- config.Message{
+			Text:     msgLines[i],
+			Username: msg.Username,
+			Channel:  msg.Channel,
+			Event:    msg.Event,
 		}
 	}
 	return "", nil
@@ -253,7 +257,7 @@ func (b *Birc) doSend() {
 			colorCode := checksum%14 + 2 // quick fix - prevent white or black color codes
 			username = fmt.Sprintf("\x03%02d%s\x0F", colorCode, msg.Username)
 		}
-		if msg.Event == config.EVENT_USER_ACTION {
+		if msg.Event == config.EventUserAction {
 			b.i.Cmd.Action(msg.Channel, username+msg.Text)
 		} else {
 			b.Log.Debugf("Sending to channel %s", msg.Channel)
@@ -266,14 +270,12 @@ func (b *Birc) endNames(client *girc.Client, event girc.Event) {
 	channel := event.Params[1]
 	sort.Strings(b.names[channel])
 	maxNamesPerPost := (300 / b.nicksPerRow()) * b.nicksPerRow()
-	continued := false
 	for len(b.names[channel]) > maxNamesPerPost {
-		b.Remote <- config.Message{Username: b.Nick, Text: b.formatnicks(b.names[channel][0:maxNamesPerPost], continued),
+		b.Remote <- config.Message{Username: b.Nick, Text: b.formatnicks(b.names[channel][0:maxNamesPerPost]),
 			Channel: channel, Account: b.Account}
 		b.names[channel] = b.names[channel][maxNamesPerPost:]
-		continued = true
 	}
-	b.Remote <- config.Message{Username: b.Nick, Text: b.formatnicks(b.names[channel], continued),
+	b.Remote <- config.Message{Username: b.Nick, Text: b.formatnicks(b.names[channel]),
 		Channel: channel, Account: b.Account}
 	b.names[channel] = nil
 	b.i.Handlers.Clear(girc.RPL_NAMREPLY)
@@ -304,16 +306,16 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 		return
 	}
 	channel := strings.ToLower(event.Params[0])
-	if event.Command == "KICK" {
+	if event.Command == "KICK" && event.Params[1] == b.Nick {
 		b.Log.Infof("Got kicked from %s by %s", channel, event.Source.Name)
 		time.Sleep(time.Duration(b.GetInt("RejoinDelay")) * time.Second)
-		b.Remote <- config.Message{Username: "system", Text: "rejoin", Channel: channel, Account: b.Account, Event: config.EVENT_REJOIN_CHANNELS}
+		b.Remote <- config.Message{Username: "system", Text: "rejoin", Channel: channel, Account: b.Account, Event: config.EventRejoinChannels}
 		return
 	}
 	if event.Command == "QUIT" {
 		if event.Source.Name == b.Nick && strings.Contains(event.Trailing, "Ping timeout") {
 			b.Log.Infof("%s reconnecting ..", b.Account)
-			b.Remote <- config.Message{Username: "system", Text: "reconnect", Channel: channel, Account: b.Account, Event: config.EVENT_FAILURE}
+			b.Remote <- config.Message{Username: "system", Text: "reconnect", Channel: channel, Account: b.Account, Event: config.EventFailure}
 			return
 		}
 	}
@@ -322,7 +324,7 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 			return
 		}
 		b.Log.Debugf("<= Sending JOIN_LEAVE event from %s to gateway", b.Account)
-		msg := config.Message{Username: "system", Text: event.Source.Name + " " + strings.ToLower(event.Command) + "s", Channel: channel, Account: b.Account, Event: config.EVENT_JOIN_LEAVE}
+		msg := config.Message{Username: "system", Text: event.Source.Name + " " + strings.ToLower(event.Command) + "s", Channel: channel, Account: b.Account, Event: config.EventJoinLeave}
 		b.Log.Debugf("<= Message is %#v", msg)
 		b.Remote <- msg
 		return
@@ -332,6 +334,7 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 
 func (b *Birc) handleNotice(client *girc.Client, event girc.Event) {
 	if strings.Contains(event.String(), "This nickname is registered") && event.Source.Name == b.GetString("NickServNick") {
+		b.Log.Debugf("Sending identify to nickserv %s", b.GetString("NickServNick"))
 		b.i.Cmd.Message(b.GetString("NickServNick"), "IDENTIFY "+b.GetString("NickServPassword"))
 	} else {
 		b.handlePrivMsg(client, event)
@@ -388,14 +391,14 @@ func (b *Birc) handlePrivMsg(client *girc.Client, event girc.Event) {
 
 	// set action event
 	if event.IsAction() {
-		rmsg.Event = config.EVENT_USER_ACTION
+		rmsg.Event = config.EventUserAction
 	}
 
 	// strip action, we made an event if it was an action
 	rmsg.Text += event.StripAction()
 
 	// strip IRC colors
-	re := regexp.MustCompile(`[[:cntrl:]](?:\d{1,2}(?:,\d{1,2})?)?`)
+	re := regexp.MustCompile(`\x03(?:\d{1,2}(?:,\d{1,2})?)?|[[:cntrl:]]`)
 	rmsg.Text = re.ReplaceAllString(rmsg.Text, "")
 
 	// start detecting the charset
@@ -458,6 +461,6 @@ func (b *Birc) storeNames(client *girc.Client, event girc.Event) {
 		strings.Split(strings.TrimSpace(event.Trailing), " ")...)
 }
 
-func (b *Birc) formatnicks(nicks []string, continued bool) string {
-	return plainformatter(nicks, b.nicksPerRow())
+func (b *Birc) formatnicks(nicks []string) string {
+	return strings.Join(nicks, ", ") + " currently on IRC"
 }

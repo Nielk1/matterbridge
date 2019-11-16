@@ -9,12 +9,12 @@ import (
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/gateway"
 	"github.com/google/gops/agent"
+	prefixed "github.com/matterbridge/logrus-prefixed-formatter"
 	log "github.com/sirupsen/logrus"
-	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 )
 
 var (
-	version = "1.10.2-dev"
+	version = "1.12.0"
 	githash string
 )
 
@@ -44,7 +44,7 @@ func main() {
 		flog.Println("WARNING: THIS IS A DEVELOPMENT VERSION. Things may break.")
 	}
 	cfg := config.NewConfig(*flagConfig)
-	cfg.General.Debug = *flagDebug
+	cfg.BridgeValues().General.Debug = *flagDebug
 	r, err := gateway.NewRouter(cfg)
 	if err != nil {
 		flog.Fatalf("Starting gateway failed: %s", err)
