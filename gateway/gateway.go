@@ -1,35 +1,20 @@
 package gateway
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/42wim/matterbridge/bridge"
-	"github.com/42wim/matterbridge/bridge/api"
 	"github.com/42wim/matterbridge/bridge/config"
-	bdiscord "github.com/42wim/matterbridge/bridge/discord"
-	bgitter "github.com/42wim/matterbridge/bridge/gitter"
-	birc "github.com/42wim/matterbridge/bridge/irc"
-	bmatrix "github.com/42wim/matterbridge/bridge/matrix"
-	bmattermost "github.com/42wim/matterbridge/bridge/mattermost"
-	brocketchat "github.com/42wim/matterbridge/bridge/rocketchat"
-	bslack "github.com/42wim/matterbridge/bridge/slack"
-	bsshchat "github.com/42wim/matterbridge/bridge/sshchat"
-	bsteam "github.com/42wim/matterbridge/bridge/steam"
-	btelegram "github.com/42wim/matterbridge/bridge/telegram"
-	bxmpp "github.com/42wim/matterbridge/bridge/xmpp"
-	bzulip "github.com/42wim/matterbridge/bridge/zulip"
-	"github.com/hashicorp/golang-lru"
+	"github.com/42wim/matterbridge/internal"
+	"github.com/d5/tengo/script"
+	"github.com/d5/tengo/stdlib"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/peterhellberg/emojilib"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 type Gateway struct {
@@ -43,6 +28,8 @@ type Gateway struct {
 	Message        chan config.Message
 	Name           string
 	Messages       *lru.Cache
+
+	logger *logrus.Entry
 }
 
 type BrMsgID struct {
@@ -51,40 +38,30 @@ type BrMsgID struct {
 	ChannelID string
 }
 
-var flog *log.Entry
+const apiProtocol = "api"
 
-var bridgeMap = map[string]bridge.Factory{
-	"api":          api.New,
-	"discord":      bdiscord.New,
-	"gitter":       bgitter.New,
-	"irc":          birc.New,
-	"mattermost":   bmattermost.New,
-	"matrix":       bmatrix.New,
-	"rocketchat":   brocketchat.New,
-	"slack-legacy": bslack.NewLegacy,
-	"slack":        bslack.New,
-	"sshchat":      bsshchat.New,
-	"steam":        bsteam.New,
-	"telegram":     btelegram.New,
-	"xmpp":         bxmpp.New,
-	"zulip":        bzulip.New,
-}
+// New creates a new Gateway object associated with the specified router and
+// following the given configuration.
+func New(rootLogger *logrus.Logger, cfg *config.Gateway, r *Router) *Gateway {
+	logger := rootLogger.WithFields(logrus.Fields{"prefix": "gateway"})
 
-const (
-	apiProtocol = "api"
-)
-
-func New(cfg config.Gateway, r *Router) *Gateway {
-	flog = log.WithFields(log.Fields{"prefix": "gateway"})
-	gw := &Gateway{Channels: make(map[string]*config.ChannelInfo), Message: r.Message,
-		Router: r, Bridges: make(map[string]*bridge.Bridge), Config: r.Config}
 	cache, _ := lru.New(5000)
-	gw.Messages = cache
-	gw.AddConfig(&cfg)
+	gw := &Gateway{
+		Channels: make(map[string]*config.ChannelInfo),
+		Message:  r.Message,
+		Router:   r,
+		Bridges:  make(map[string]*bridge.Bridge),
+		Config:   r.Config,
+		Messages: cache,
+		logger:   logger,
+	}
+	if err := gw.AddConfig(cfg); err != nil {
+		logger.Errorf("Failed to add configuration to gateway: %#v", err)
+	}
 	return gw
 }
 
-// Find the canonical ID that the message is keyed under in cache
+// FindCanonicalMsgID returns the ID under which a message was stored in the cache.
 func (gw *Gateway) FindCanonicalMsgID(protocol string, mID string) string {
 	ID := protocol + " " + mID
 	if gw.Messages.Contains(ID) {
@@ -104,27 +81,50 @@ func (gw *Gateway) FindCanonicalMsgID(protocol string, mID string) string {
 	return ""
 }
 
+// AddBridge sets up a new bridge in the gateway object with the specified configuration.
 func (gw *Gateway) AddBridge(cfg *config.Bridge) error {
 	br := gw.Router.getBridge(cfg.Account)
 	if br == nil {
+		gw.checkConfig(cfg)
 		br = bridge.New(cfg)
 		br.Config = gw.Router.Config
 		br.General = &gw.BridgeValues().General
-		// set logging
-		br.Log = log.WithFields(log.Fields{"prefix": "bridge"})
-		brconfig := &bridge.Config{Remote: gw.Message, Log: log.WithFields(log.Fields{"prefix": br.Protocol}), Bridge: br}
+		br.Log = gw.logger.WithFields(logrus.Fields{"prefix": br.Protocol})
+		brconfig := &bridge.Config{
+			Remote: gw.Message,
+			Bridge: br,
+		}
 		// add the actual bridger for this protocol to this bridge using the bridgeMap
-		br.Bridger = bridgeMap[br.Protocol](brconfig)
+		if _, ok := gw.Router.BridgeMap[br.Protocol]; !ok {
+			gw.logger.Fatalf("Incorrect protocol %s specified in gateway configuration %s, exiting.", br.Protocol, cfg.Account)
+		}
+		br.Bridger = gw.Router.BridgeMap[br.Protocol](brconfig)
 	}
 	gw.mapChannelsToBridge(br)
 	gw.Bridges[cfg.Account] = br
 	return nil
 }
 
+func (gw *Gateway) checkConfig(cfg *config.Bridge) {
+	match := false
+	for _, key := range gw.Router.Config.Viper().AllKeys() {
+		if strings.HasPrefix(key, cfg.Account) {
+			match = true
+			break
+		}
+	}
+	if !match {
+		gw.logger.Fatalf("Account %s defined in gateway %s but no configuration found, exiting.", cfg.Account, gw.Name)
+	}
+}
+
+// AddConfig associates a new configuration with the gateway object.
 func (gw *Gateway) AddConfig(cfg *config.Gateway) error {
 	gw.Name = cfg.Name
 	gw.MyConfig = cfg
-	gw.mapChannels()
+	if err := gw.mapChannels(); err != nil {
+		gw.logger.Errorf("mapChannels() failed: %s", err)
+	}
 	for _, br := range append(gw.MyConfig.In, append(gw.MyConfig.InOut, gw.MyConfig.Out...)...) {
 		br := br //scopelint
 		err := gw.AddBridge(&br)
@@ -144,18 +144,22 @@ func (gw *Gateway) mapChannelsToBridge(br *bridge.Bridge) {
 }
 
 func (gw *Gateway) reconnectBridge(br *bridge.Bridge) {
-	br.Disconnect()
+	if err := br.Disconnect(); err != nil {
+		gw.logger.Errorf("Disconnect() %s failed: %s", br.Account, err)
+	}
 	time.Sleep(time.Second * 5)
 RECONNECT:
-	flog.Infof("Reconnecting %s", br.Account)
+	gw.logger.Infof("Reconnecting %s", br.Account)
 	err := br.Connect()
 	if err != nil {
-		flog.Errorf("Reconnection failed: %s. Trying again in 60 seconds", err)
+		gw.logger.Errorf("Reconnection failed: %s. Trying again in 60 seconds", err)
 		time.Sleep(time.Second * 60)
 		goto RECONNECT
 	}
 	br.Joined = make(map[string]bool)
-	br.JoinChannels()
+	if err := br.JoinChannels(); err != nil {
+		gw.logger.Errorf("JoinChannels() %s failed: %s", br.Account, err)
+	}
 }
 
 func (gw *Gateway) mapChannelConfig(cfg []config.Bridge, direction string) {
@@ -167,10 +171,24 @@ func (gw *Gateway) mapChannelConfig(cfg []config.Bridge, direction string) {
 		if strings.HasPrefix(br.Account, "irc.") {
 			br.Channel = strings.ToLower(br.Channel)
 		}
+		if strings.HasPrefix(br.Account, "mattermost.") && strings.HasPrefix(br.Channel, "#") {
+			gw.logger.Errorf("Mattermost channels do not start with a #: remove the # in %s", br.Channel)
+			os.Exit(1)
+		}
+		if strings.HasPrefix(br.Account, "zulip.") && !strings.Contains(br.Channel, "/topic:") {
+			gw.logger.Errorf("Breaking change, since matterbridge 1.14.0 zulip channels need to specify the topic with channel/topic:mytopic in %s of %s", br.Channel, br.Account)
+			os.Exit(1)
+		}
 		ID := br.Channel + br.Account
 		if _, ok := gw.Channels[ID]; !ok {
-			channel := &config.ChannelInfo{Name: br.Channel, Direction: direction, ID: ID, Options: br.Options, Account: br.Account,
-				SameChannel: make(map[string]bool)}
+			channel := &config.ChannelInfo{
+				Name:        br.Channel,
+				Direction:   direction,
+				ID:          ID,
+				Options:     br.Options,
+				Account:     br.Account,
+				SameChannel: make(map[string]bool),
+			}
 			channel.SameChannel[gw.Name] = br.SameChannel
 			gw.Channels[channel.ID] = channel
 		} else {
@@ -198,10 +216,21 @@ func (gw *Gateway) getDestChannel(msg *config.Message, dest bridge.Bridge) []con
 		return channels
 	}
 
+	// discord join/leave is for the whole bridge, isn't a per channel join/leave
+	if msg.Event == config.EventJoinLeave && getProtocol(msg) == "discord" && msg.Channel == "" {
+		for _, channel := range gw.Channels {
+			if channel.Account == dest.Account && strings.Contains(channel.Direction, "out") &&
+				gw.validGatewayDest(msg) {
+				channels = append(channels, *channel)
+			}
+		}
+		return channels
+	}
+
 	// if source channel is in only, do nothing
 	for _, channel := range gw.Channels {
 		// lookup the channel from the message
-		if channel.ID == getChannelID(*msg) {
+		if channel.ID == getChannelID(msg) {
 			// we only have destinations if the original message is from an "in" (sending) channel
 			if !strings.Contains(channel.Direction, "in") {
 				return channels
@@ -210,11 +239,11 @@ func (gw *Gateway) getDestChannel(msg *config.Message, dest bridge.Bridge) []con
 		}
 	}
 	for _, channel := range gw.Channels {
-		if _, ok := gw.Channels[getChannelID(*msg)]; !ok {
+		if _, ok := gw.Channels[getChannelID(msg)]; !ok {
 			continue
 		}
 
-		// do samechannelgateway flogic
+		// do samechannelgateway logic
 		if channel.SameChannel[msg.Gateway] {
 			if msg.Channel == channel.Name && msg.Account != dest.Account {
 				channels = append(channels, *channel)
@@ -228,7 +257,7 @@ func (gw *Gateway) getDestChannel(msg *config.Message, dest bridge.Bridge) []con
 	return channels
 }
 
-func (gw *Gateway) getDestMsgID(msgID string, dest *bridge.Bridge, channel config.ChannelInfo) string {
+func (gw *Gateway) getDestMsgID(msgID string, dest *bridge.Bridge, channel *config.ChannelInfo) string {
 	if res, ok := gw.Messages.Get(msgID); ok {
 		IDs := res.([]*BrMsgID)
 		for _, id := range IDs {
@@ -242,103 +271,23 @@ func (gw *Gateway) getDestMsgID(msgID string, dest *bridge.Bridge, channel confi
 	return ""
 }
 
-func (gw *Gateway) handleMessage(msg config.Message, dest *bridge.Bridge) []*BrMsgID {
-	var brMsgIDs []*BrMsgID
-
-	// if we have an attached file, or other info
-	if msg.Extra != nil {
-		if len(msg.Extra[config.EventFileFailureSize]) != 0 {
-			if msg.Text == "" {
-				return brMsgIDs
-			}
-		}
+// ignoreTextEmpty returns true if we need to ignore a message with an empty text.
+func (gw *Gateway) ignoreTextEmpty(msg *config.Message) bool {
+	if msg.Text != "" {
+		return false
 	}
-
-	// Avatar downloads are only relevant for telegram and mattermost for now
-	if msg.Event == config.EventAvatarDownload {
-		if dest.Protocol != "mattermost" &&
-			dest.Protocol != "telegram" {
-			return brMsgIDs
-		}
+	if msg.Event == config.EventUserTyping {
+		return false
 	}
-
-	// only relay join/part when configured
-	if msg.Event == config.EventJoinLeave && !gw.Bridges[dest.Account].GetBool("ShowJoinPart") {
-		return brMsgIDs
+	// we have an attachment or actual bytes, do not ignore
+	if msg.Extra != nil &&
+		(msg.Extra["attachments"] != nil ||
+			len(msg.Extra["file"]) > 0 ||
+			len(msg.Extra[config.EventFileFailureSize]) > 0) {
+		return false
 	}
-
-	// only relay topic change when configured
-	if msg.Event == config.EventTopicChange && !gw.Bridges[dest.Account].GetBool("ShowTopicChange") {
-		return brMsgIDs
-	}
-
-	// broadcast to every out channel (irc QUIT)
-	if msg.Channel == "" && msg.Event != config.EventJoinLeave {
-		flog.Debug("empty channel")
-		return brMsgIDs
-	}
-
-	// Get the ID of the parent message in thread
-	var canonicalParentMsgID string
-	if msg.ParentID != "" && (gw.BridgeValues().General.PreserveThreading || dest.GetBool("PreserveThreading")) {
-		canonicalParentMsgID = gw.FindCanonicalMsgID(msg.Protocol, msg.ParentID)
-	}
-
-	originchannel := msg.Channel
-	origmsg := msg
-	channels := gw.getDestChannel(&msg, *dest)
-	for _, channel := range channels {
-		// Only send the avatar download event to ourselves.
-		if msg.Event == config.EventAvatarDownload {
-			if channel.ID != getChannelID(origmsg) {
-				continue
-			}
-		} else {
-			// do not send to ourself for any other event
-			if channel.ID == getChannelID(origmsg) {
-				continue
-			}
-		}
-
-		// Too noisy to log like other events
-		if msg.Event != config.EventUserTyping {
-			flog.Debugf("=> Sending %#v from %s (%s) to %s (%s)", msg, msg.Account, originchannel, dest.Account, channel.Name)
-		}
-
-		msg.Channel = channel.Name
-		msg.Avatar = gw.modifyAvatar(origmsg, dest)
-		msg.Username = gw.modifyUsername(origmsg, dest)
-
-		msg.ID = gw.getDestMsgID(origmsg.Protocol+" "+origmsg.ID, dest, channel)
-
-		// for api we need originchannel as channel
-		if dest.Protocol == apiProtocol {
-			msg.Channel = originchannel
-		}
-
-		msg.ParentID = gw.getDestMsgID(origmsg.Protocol+" "+canonicalParentMsgID, dest, channel)
-		if msg.ParentID == "" {
-			msg.ParentID = canonicalParentMsgID
-		}
-
-		// if we are using mattermost plugin account, send messages to MattermostPlugin channel
-		// that can be picked up by the mattermost matterbridge plugin
-		if dest.Account == "mattermost.plugin" {
-			gw.Router.MattermostPlugin <- msg
-		}
-
-		mID, err := dest.Send(msg)
-		if err != nil {
-			flog.Error(err)
-		}
-
-		// append the message ID (mID) from this bridge (dest) to our brMsgIDs slice
-		if mID != "" {
-			flog.Debugf("mID %s: %s", dest.Account, mID)
-			brMsgIDs = append(brMsgIDs, &BrMsgID{dest, dest.Protocol + " " + mID, channel.ID})
-		}
-	}
-	return brMsgIDs
+	gw.logger.Debugf("ignoring empty message %#v from %s", msg, msg.Account)
+	return true
 }
 
 func (gw *Gateway) ignoreMessage(msg *config.Message) bool {
@@ -347,59 +296,23 @@ func (gw *Gateway) ignoreMessage(msg *config.Message) bool {
 		return true
 	}
 
-	// check if we need to ignore a empty message
-	if msg.Text == "" {
-		if msg.Event == config.EventUserTyping {
-			return false
-		}
-		// we have an attachment or actual bytes, do not ignore
-		if msg.Extra != nil &&
-			(msg.Extra["attachments"] != nil ||
-				len(msg.Extra["file"]) > 0 ||
-				len(msg.Extra[config.EventFileFailureSize]) > 0) {
-			return false
-		}
-		flog.Debugf("ignoring empty message %#v from %s", msg, msg.Account)
+	igNicks := strings.Fields(gw.Bridges[msg.Account].GetString("IgnoreNicks"))
+	igMessages := strings.Fields(gw.Bridges[msg.Account].GetString("IgnoreMessages"))
+	if gw.ignoreTextEmpty(msg) || gw.ignoreText(msg.Username, igNicks) || gw.ignoreText(msg.Text, igMessages) {
 		return true
 	}
 
-	// is the username in IgnoreNicks field
-	for _, entry := range strings.Fields(gw.Bridges[msg.Account].GetString("IgnoreNicks")) {
-		if msg.Username == entry {
-			flog.Debugf("ignoring %s from %s", msg.Username, msg.Account)
-			return true
-		}
-	}
-
-	// does the message match regex in IgnoreMessages field
-	// TODO do not compile regexps everytime
-	for _, entry := range strings.Fields(gw.Bridges[msg.Account].GetString("IgnoreMessages")) {
-		if entry != "" {
-			re, err := regexp.Compile(entry)
-			if err != nil {
-				flog.Errorf("incorrect regexp %s for %s", entry, msg.Account)
-				continue
-			}
-			if re.MatchString(msg.Text) {
-				flog.Debugf("matching %s. ignoring %s from %s", entry, msg.Text, msg.Account)
-				return true
-			}
-		}
-	}
 	return false
 }
 
-func (gw *Gateway) modifyUsername(msg config.Message, dest *bridge.Bridge) string {
+func (gw *Gateway) modifyUsername(msg *config.Message, dest *bridge.Bridge) string {
 	br := gw.Bridges[msg.Account]
 	msg.Protocol = br.Protocol
-	if gw.BridgeValues().General.StripNick || dest.GetBool("StripNick") {
+	if dest.GetBool("StripNick") {
 		re := regexp.MustCompile("[^a-zA-Z0-9]+")
 		msg.Username = re.ReplaceAllString(msg.Username, "")
 	}
 	nick := dest.GetString("RemoteNickFormat")
-	if nick == "" {
-		nick = gw.BridgeValues().General.RemoteNickFormat
-	}
 
 	// loop to replace nicks
 	for _, outer := range br.GetStringSlice2D("ReplaceNicks") {
@@ -408,7 +321,7 @@ func (gw *Gateway) modifyUsername(msg config.Message, dest *bridge.Bridge) strin
 		// TODO move compile to bridge init somewhere
 		re, err := regexp.Compile(search)
 		if err != nil {
-			flog.Errorf("regexp in %s failed: %s", msg.Account, err)
+			gw.logger.Errorf("regexp in %s failed: %s", msg.Account, err)
 			break
 		}
 		msg.Username = re.ReplaceAllString(msg.Username, replace)
@@ -433,14 +346,16 @@ func (gw *Gateway) modifyUsername(msg config.Message, dest *bridge.Bridge) strin
 	nick = strings.Replace(nick, "{LABEL}", br.GetString("Label"), -1)
 	nick = strings.Replace(nick, "{NICK}", msg.Username, -1)
 	nick = strings.Replace(nick, "{CHANNEL}", msg.Channel, -1)
+	tengoNick, err := gw.modifyUsernameTengo(msg, br)
+	if err != nil {
+		gw.logger.Errorf("modifyUsernameTengo error: %s", err)
+	}
+	nick = strings.Replace(nick, "{TENGO}", tengoNick, -1) //nolint:gocritic
 	return nick
 }
 
-func (gw *Gateway) modifyAvatar(msg config.Message, dest *bridge.Bridge) string {
-	iconurl := gw.BridgeValues().General.IconURL
-	if iconurl == "" {
-		iconurl = dest.GetString("IconURL")
-	}
+func (gw *Gateway) modifyAvatar(msg *config.Message, dest *bridge.Bridge) string {
+	iconurl := dest.GetString("IconURL")
 	iconurl = strings.Replace(iconurl, "{NICK}", msg.Username, -1)
 	if msg.Avatar == "" {
 		msg.Avatar = iconurl
@@ -449,6 +364,13 @@ func (gw *Gateway) modifyAvatar(msg config.Message, dest *bridge.Bridge) string 
 }
 
 func (gw *Gateway) modifyMessage(msg *config.Message) {
+	if err := modifyMessageTengo(gw.BridgeValues().General.TengoModifyMessage, msg); err != nil {
+		gw.logger.Errorf("TengoModifyMessage failed: %s", err)
+	}
+	if err := modifyMessageTengo(gw.BridgeValues().Tengo.Message, msg); err != nil {
+		gw.logger.Errorf("Tengo.Message failed: %s", err)
+	}
+
 	// replace :emoji: to unicode
 	msg.Text = emojilib.Replace(msg.Text)
 
@@ -460,11 +382,13 @@ func (gw *Gateway) modifyMessage(msg *config.Message) {
 		// TODO move compile to bridge init somewhere
 		re, err := regexp.Compile(search)
 		if err != nil {
-			flog.Errorf("regexp in %s failed: %s", msg.Account, err)
+			gw.logger.Errorf("regexp in %s failed: %s", msg.Account, err)
 			break
 		}
 		msg.Text = re.ReplaceAllString(msg.Text, replace)
 	}
+
+	gw.handleExtractNicks(msg)
 
 	// messages from api have Gateway specified, don't overwrite
 	if msg.Protocol != apiProtocol {
@@ -472,96 +396,212 @@ func (gw *Gateway) modifyMessage(msg *config.Message) {
 	}
 }
 
-// handleFiles uploads or places all files on the given msg to the MediaServer and
-// adds the new URL of the file on the MediaServer onto the given msg.
-func (gw *Gateway) handleFiles(msg *config.Message) {
-	reg := regexp.MustCompile("[^a-zA-Z0-9]+")
-
-	// If we don't have a attachfield or we don't have a mediaserver configured return
-	if msg.Extra == nil ||
-		(gw.BridgeValues().General.MediaServerUpload == "" &&
-			gw.BridgeValues().General.MediaDownloadPath == "") {
-		return
-	}
-
-	// If we don't have files, nothing to upload.
-	if len(msg.Extra["file"]) == 0 {
-		return
-	}
-
-	client := &http.Client{
-		Timeout: time.Second * 5,
-	}
-
-	for i, f := range msg.Extra["file"] {
-		fi := f.(config.FileInfo)
-		ext := filepath.Ext(fi.Name)
-		fi.Name = fi.Name[0 : len(fi.Name)-len(ext)]
-		fi.Name = reg.ReplaceAllString(fi.Name, "_")
-		fi.Name += ext
-
-		sha1sum := fmt.Sprintf("%x", sha1.Sum(*fi.Data))[:8]
-
-		if gw.BridgeValues().General.MediaServerUpload != "" {
-			// Use MediaServerUpload. Upload using a PUT HTTP request and basicauth.
-
-			url := gw.BridgeValues().General.MediaServerUpload + "/" + sha1sum + "/" + fi.Name
-
-			req, err := http.NewRequest("PUT", url, bytes.NewReader(*fi.Data))
-			if err != nil {
-				flog.Errorf("mediaserver upload failed, could not create request: %#v", err)
-				continue
-			}
-
-			flog.Debugf("mediaserver upload url: %s", url)
-
-			req.Header.Set("Content-Type", "binary/octet-stream")
-			_, err = client.Do(req)
-			if err != nil {
-				flog.Errorf("mediaserver upload failed, could not Do request: %#v", err)
-				continue
-			}
-		} else {
-			// Use MediaServerPath. Place the file on the current filesystem.
-
-			dir := gw.BridgeValues().General.MediaDownloadPath + "/" + sha1sum
-			err := os.Mkdir(dir, os.ModePerm)
-			if err != nil && !os.IsExist(err) {
-				flog.Errorf("mediaserver path failed, could not mkdir: %s %#v", err, err)
-				continue
-			}
-
-			path := dir + "/" + fi.Name
-			flog.Debugf("mediaserver path placing file: %s", path)
-
-			err = ioutil.WriteFile(path, *fi.Data, os.ModePerm)
-			if err != nil {
-				flog.Errorf("mediaserver path failed, could not writefile: %s %#v", err, err)
-				continue
-			}
+// SendMessage sends a message (with specified parentID) to the channel on the selected
+// destination bridge and returns a message ID or an error.
+func (gw *Gateway) SendMessage(
+	rmsg *config.Message,
+	dest *bridge.Bridge,
+	channel *config.ChannelInfo,
+	canonicalParentMsgID string,
+) (string, error) {
+	msg := *rmsg
+	// Only send the avatar download event to ourselves.
+	if msg.Event == config.EventAvatarDownload {
+		if channel.ID != getChannelID(rmsg) {
+			return "", nil
 		}
-
-		// Download URL.
-		durl := gw.BridgeValues().General.MediaServerDownload + "/" + sha1sum + "/" + fi.Name
-
-		flog.Debugf("mediaserver download URL = %s", durl)
-
-		// We uploaded/placed the file successfully. Add the SHA and URL.
-		extra := msg.Extra["file"][i].(config.FileInfo)
-		extra.URL = durl
-		extra.SHA = sha1sum
-		msg.Extra["file"][i] = extra
+	} else {
+		// do not send to ourself for any other event
+		if channel.ID == getChannelID(rmsg) {
+			return "", nil
+		}
 	}
+
+	// Too noisy to log like other events
+	if msg.Event != config.EventUserTyping {
+		gw.logger.Debugf("=> Sending %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
+	}
+
+	msg.Channel = channel.Name
+	msg.Avatar = gw.modifyAvatar(rmsg, dest)
+	msg.Username = gw.modifyUsername(rmsg, dest)
+
+	msg.ID = gw.getDestMsgID(rmsg.Protocol+" "+rmsg.ID, dest, channel)
+
+	// for api we need originchannel as channel
+	if dest.Protocol == apiProtocol {
+		msg.Channel = rmsg.Channel
+	}
+
+	msg.ParentID = gw.getDestMsgID(rmsg.Protocol+" "+canonicalParentMsgID, dest, channel)
+	if msg.ParentID == "" {
+		msg.ParentID = canonicalParentMsgID
+	}
+
+	// if the parentID is still empty and we have a parentID set in the original message
+	// this means that we didn't find it in the cache so set it "msg-parent-not-found"
+	if msg.ParentID == "" && rmsg.ParentID != "" {
+		msg.ParentID = "msg-parent-not-found"
+	}
+
+	err := gw.modifySendMessageTengo(rmsg, &msg, dest)
+	if err != nil {
+		gw.logger.Errorf("modifySendMessageTengo: %s", err)
+	}
+
+	// if we are using mattermost plugin account, send messages to MattermostPlugin channel
+	// that can be picked up by the mattermost matterbridge plugin
+	if dest.Account == "mattermost.plugin" {
+		gw.Router.MattermostPlugin <- msg
+	}
+
+	mID, err := dest.Send(msg)
+	if err != nil {
+		return mID, err
+	}
+
+	// append the message ID (mID) from this bridge (dest) to our brMsgIDs slice
+	if mID != "" {
+		gw.logger.Debugf("mID %s: %s", dest.Account, mID)
+		return mID, nil
+		//brMsgIDs = append(brMsgIDs, &BrMsgID{dest, dest.Protocol + " " + mID, channel.ID})
+	}
+	return "", nil
 }
 
 func (gw *Gateway) validGatewayDest(msg *config.Message) bool {
 	return msg.Gateway == gw.Name
 }
 
-func getChannelID(msg config.Message) string {
+func getChannelID(msg *config.Message) string {
 	return msg.Channel + msg.Account
 }
 
 func isAPI(account string) bool {
 	return strings.HasPrefix(account, "api.")
+}
+
+// ignoreText returns true if text matches any of the input regexes.
+func (gw *Gateway) ignoreText(text string, input []string) bool {
+	for _, entry := range input {
+		if entry == "" {
+			continue
+		}
+		// TODO do not compile regexps everytime
+		re, err := regexp.Compile(entry)
+		if err != nil {
+			gw.logger.Errorf("incorrect regexp %s", entry)
+			continue
+		}
+		if re.MatchString(text) {
+			gw.logger.Debugf("matching %s. ignoring %s", entry, text)
+			return true
+		}
+	}
+	return false
+}
+
+func getProtocol(msg *config.Message) string {
+	p := strings.Split(msg.Account, ".")
+	return p[0]
+}
+
+func modifyMessageTengo(filename string, msg *config.Message) error {
+	if filename == "" {
+		return nil
+	}
+	res, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	s := script.New(res)
+	s.SetImports(stdlib.GetModuleMap(stdlib.AllModuleNames()...))
+	_ = s.Add("msgText", msg.Text)
+	_ = s.Add("msgUsername", msg.Username)
+	_ = s.Add("msgAccount", msg.Account)
+	_ = s.Add("msgChannel", msg.Channel)
+	c, err := s.Compile()
+	if err != nil {
+		return err
+	}
+	if err := c.Run(); err != nil {
+		return err
+	}
+	msg.Text = c.Get("msgText").String()
+	msg.Username = c.Get("msgUsername").String()
+	return nil
+}
+
+func (gw *Gateway) modifyUsernameTengo(msg *config.Message, br *bridge.Bridge) (string, error) {
+	filename := gw.BridgeValues().Tengo.RemoteNickFormat
+	if filename == "" {
+		return "", nil
+	}
+	res, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	s := script.New(res)
+	s.SetImports(stdlib.GetModuleMap(stdlib.AllModuleNames()...))
+	_ = s.Add("result", "")
+	_ = s.Add("msgText", msg.Text)
+	_ = s.Add("msgUsername", msg.Username)
+	_ = s.Add("nick", msg.Username)
+	_ = s.Add("msgAccount", msg.Account)
+	_ = s.Add("msgChannel", msg.Channel)
+	_ = s.Add("channel", msg.Channel)
+	_ = s.Add("msgProtocol", msg.Protocol)
+	_ = s.Add("remoteAccount", br.Account)
+	_ = s.Add("protocol", br.Protocol)
+	_ = s.Add("bridge", br.Name)
+	_ = s.Add("gateway", gw.Name)
+	c, err := s.Compile()
+	if err != nil {
+		return "", err
+	}
+	if err := c.Run(); err != nil {
+		return "", err
+	}
+	return c.Get("result").String(), nil
+}
+
+func (gw *Gateway) modifySendMessageTengo(origmsg *config.Message, msg *config.Message, br *bridge.Bridge) error {
+	filename := gw.BridgeValues().Tengo.OutMessage
+	var res []byte
+	var err error
+	if filename == "" {
+		res, err = internal.Asset("tengo/outmessage.tengo")
+		if err != nil {
+			return err
+		}
+	} else {
+		res, err = ioutil.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+	}
+	s := script.New(res)
+	s.SetImports(stdlib.GetModuleMap(stdlib.AllModuleNames()...))
+	_ = s.Add("inAccount", origmsg.Account)
+	_ = s.Add("inProtocol", origmsg.Protocol)
+	_ = s.Add("inChannel", origmsg.Channel)
+	_ = s.Add("inGateway", origmsg.Gateway)
+	_ = s.Add("inEvent", origmsg.Event)
+	_ = s.Add("outAccount", br.Account)
+	_ = s.Add("outProtocol", br.Protocol)
+	_ = s.Add("outChannel", msg.Channel)
+	_ = s.Add("outGateway", gw.Name)
+	_ = s.Add("outEvent", msg.Event)
+	_ = s.Add("msgText", msg.Text)
+	_ = s.Add("msgUsername", msg.Username)
+	c, err := s.Compile()
+	if err != nil {
+		return err
+	}
+	if err := c.Run(); err != nil {
+		return err
+	}
+	msg.Text = c.Get("msgText").String()
+	msg.Username = c.Get("msgUsername").String()
+	return nil
 }

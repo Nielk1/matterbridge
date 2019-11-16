@@ -1,10 +1,11 @@
 package bridge
 
 import (
-	"github.com/42wim/matterbridge/bridge/config"
-	log "github.com/sirupsen/logrus"
-
 	"strings"
+	"sync"
+
+	"github.com/42wim/matterbridge/bridge/config"
+	"github.com/sirupsen/logrus"
 )
 
 type Bridger interface {
@@ -16,42 +17,52 @@ type Bridger interface {
 
 type Bridge struct {
 	Bridger
-	Name     string
-	Account  string
-	Protocol string
-	Channels map[string]config.ChannelInfo
-	Joined   map[string]bool
-	Log      *log.Entry
-	Config   config.Config
-	General  *config.Protocol
+	*sync.RWMutex
+
+	Name           string
+	Account        string
+	Protocol       string
+	Channels       map[string]config.ChannelInfo
+	Joined         map[string]bool
+	ChannelMembers *config.ChannelMembers
+	Log            *logrus.Entry
+	Config         config.Config
+	General        *config.Protocol
 }
 
 type Config struct {
-	//	General *config.Protocol
-	Remote chan config.Message
-	Log    *log.Entry
 	*Bridge
+
+	Remote chan config.Message
 }
 
 // Factory is the factory function to create a bridge
 type Factory func(*Config) Bridger
 
 func New(bridge *config.Bridge) *Bridge {
-	b := new(Bridge)
-	b.Channels = make(map[string]config.ChannelInfo)
 	accInfo := strings.Split(bridge.Account, ".")
 	protocol := accInfo[0]
 	name := accInfo[1]
-	b.Name = name
-	b.Protocol = protocol
-	b.Account = bridge.Account
-	b.Joined = make(map[string]bool)
-	return b
+
+	return &Bridge{
+		RWMutex:  new(sync.RWMutex),
+		Channels: make(map[string]config.ChannelInfo),
+		Name:     name,
+		Protocol: protocol,
+		Account:  bridge.Account,
+		Joined:   make(map[string]bool),
+	}
 }
 
 func (b *Bridge) JoinChannels() error {
-	err := b.joinChannels(b.Channels, b.Joined)
-	return err
+	return b.joinChannels(b.Channels, b.Joined)
+}
+
+// SetChannelMembers sets the newMembers to the bridge ChannelMembers
+func (b *Bridge) SetChannelMembers(newMembers *config.ChannelMembers) {
+	b.Lock()
+	b.ChannelMembers = newMembers
+	b.Unlock()
 }
 
 func (b *Bridge) joinChannels(channels map[string]config.ChannelInfo, exists map[string]bool) error {

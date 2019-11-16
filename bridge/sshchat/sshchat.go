@@ -9,7 +9,6 @@ import (
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/shazow/ssh-chat/sshd"
-	log "github.com/sirupsen/logrus"
 )
 
 type Bsshchat struct {
@@ -23,21 +22,35 @@ func New(cfg *bridge.Config) bridge.Bridger {
 }
 
 func (b *Bsshchat) Connect() error {
-	var err error
 	b.Log.Infof("Connecting %s", b.GetString("Server"))
+
+	// connHandler will be called by 'sshd.ConnectShell()' below
+	// once the connection is established in order to handle it.
+	connErr := make(chan error, 1) // Needs to be buffered.
+	connSignal := make(chan struct{})
+	connHandler := func(r io.Reader, w io.WriteCloser) error {
+		b.r = bufio.NewScanner(r)
+		b.r.Scan()
+		b.w = w
+		if _, err := b.w.Write([]byte("/theme mono\r\n/quiet\r\n")); err != nil {
+			return err
+		}
+		close(connSignal) // Connection is established so we can signal the success.
+		return b.handleSSHChat()
+	}
+
 	go func() {
-		err = sshd.ConnectShell(b.GetString("Server"), b.GetString("Nick"), func(r io.Reader, w io.WriteCloser) error {
-			b.r = bufio.NewScanner(r)
-			b.w = w
-			b.r.Scan()
-			w.Write([]byte("/theme mono\r\n"))
-			b.handleSSHChat()
-			return nil
-		})
+		// As a successful connection will result in this returning after the Connection
+		// method has already returned point we NEED to have a buffered channel to still
+		// be able to write.
+		connErr <- sshd.ConnectShell(b.GetString("Server"), b.GetString("Nick"), connHandler)
 	}()
-	if err != nil {
-		b.Log.Debugf("%#v", err)
+
+	select {
+	case err := <-connErr:
+		b.Log.Error("Connection failed")
 		return err
+	case <-connSignal:
 	}
 	b.Log.Info("Connection succeeded")
 	return nil
@@ -59,27 +72,16 @@ func (b *Bsshchat) Send(msg config.Message) (string, error) {
 	b.Log.Debugf("=> Receiving %#v", msg)
 	if msg.Extra != nil {
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			b.w.Write([]byte(rmsg.Username + rmsg.Text + "\r\n"))
+			if _, err := b.w.Write([]byte(rmsg.Username + rmsg.Text + "\r\n")); err != nil {
+				b.Log.Errorf("Could not send extra message: %#v", err)
+			}
 		}
 		if len(msg.Extra["file"]) > 0 {
-			for _, f := range msg.Extra["file"] {
-				fi := f.(config.FileInfo)
-				if fi.Comment != "" {
-					msg.Text += fi.Comment + ": "
-				}
-				if fi.URL != "" {
-					msg.Text = fi.URL
-					if fi.Comment != "" {
-						msg.Text = fi.Comment + ": " + fi.URL
-					}
-				}
-				b.w.Write([]byte(msg.Username + msg.Text))
-			}
-			return "", nil
+			return b.handleUploadFile(&msg)
 		}
 	}
-	b.w.Write([]byte(msg.Username + msg.Text + "\r\n"))
-	return "", nil
+	_, err := b.w.Write([]byte(msg.Username + msg.Text + "\r\n"))
+	return "", err
 }
 
 /*
@@ -125,17 +127,39 @@ func (b *Bsshchat) handleSSHChat() error {
 			if !strings.Contains(b.r.Text(), "\033[K") {
 				continue
 			}
+			if strings.Contains(b.r.Text(), "Rate limiting is in effect") {
+				continue
+			}
 			res := strings.Split(stripPrompt(b.r.Text()), ":")
 			if res[0] == "-> Set theme" {
 				wait = false
-				log.Debugf("mono found, allowing")
+				b.Log.Debugf("mono found, allowing")
 				continue
 			}
 			if !wait {
 				b.Log.Debugf("<= Message %#v", res)
-				rmsg := config.Message{Username: res[0], Text: strings.Join(res[1:], ":"), Channel: "sshchat", Account: b.Account, UserID: "nick"}
+				rmsg := config.Message{Username: res[0], Text: strings.TrimSpace(strings.Join(res[1:], ":")), Channel: "sshchat", Account: b.Account, UserID: "nick"}
 				b.Remote <- rmsg
 			}
 		}
 	}
+}
+
+func (b *Bsshchat) handleUploadFile(msg *config.Message) (string, error) {
+	for _, f := range msg.Extra["file"] {
+		fi := f.(config.FileInfo)
+		if fi.Comment != "" {
+			msg.Text += fi.Comment + ": "
+		}
+		if fi.URL != "" {
+			msg.Text = fi.URL
+			if fi.Comment != "" {
+				msg.Text = fi.Comment + ": " + fi.URL
+			}
+		}
+		if _, err := b.w.Write([]byte(msg.Username + msg.Text + "\r\n")); err != nil {
+			b.Log.Errorf("Could not send file message: %#v", err)
+		}
+	}
+	return "", nil
 }

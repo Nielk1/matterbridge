@@ -1,7 +1,6 @@
 package bslack
 
 import (
-	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,162 +8,14 @@ import (
 
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/nlopes/slack"
+	"github.com/sirupsen/logrus"
 )
-
-func (b *Bslack) getUser(id string) *slack.User {
-	b.usersMutex.RLock()
-	defer b.usersMutex.RUnlock()
-
-	return b.users[id]
-}
-
-func (b *Bslack) getUsername(id string) string {
-	if user := b.getUser(id); user != nil {
-		if user.Profile.DisplayName != "" {
-			return user.Profile.DisplayName
-		}
-		return user.Name
-	}
-	b.Log.Warnf("Could not find user with ID '%s'", id)
-	return ""
-}
-
-func (b *Bslack) getAvatar(id string) string {
-	if user := b.getUser(id); user != nil {
-		return user.Profile.Image48
-	}
-	return ""
-}
-
-func (b *Bslack) getChannel(channel string) (*slack.Channel, error) {
-	if strings.HasPrefix(channel, "ID:") {
-		return b.getChannelByID(strings.TrimPrefix(channel, "ID:"))
-	}
-	return b.getChannelByName(channel)
-}
-
-func (b *Bslack) getChannelByName(name string) (*slack.Channel, error) {
-	b.channelsMutex.RLock()
-	defer b.channelsMutex.RUnlock()
-
-	if channel, ok := b.channelsByName[name]; ok {
-		return channel, nil
-	}
-	return nil, fmt.Errorf("%s: channel %s not found", b.Account, name)
-}
-
-func (b *Bslack) getChannelByID(ID string) (*slack.Channel, error) {
-	b.channelsMutex.RLock()
-	defer b.channelsMutex.RUnlock()
-
-	if channel, ok := b.channelsByID[ID]; ok {
-		return channel, nil
-	}
-	return nil, fmt.Errorf("%s: channel %s not found", b.Account, ID)
-}
-
-const minimumRefreshInterval = 10 * time.Second
-
-func (b *Bslack) populateUsers() {
-	b.refreshMutex.Lock()
-	if time.Now().Before(b.earliestUserRefresh) || b.refreshInProgress {
-		b.Log.Debugf("Not refreshing user list as it was done less than %v ago.",
-			minimumRefreshInterval)
-		b.refreshMutex.Unlock()
-
-		return
-	}
-	b.refreshInProgress = true
-	b.refreshMutex.Unlock()
-
-	newUsers := map[string]*slack.User{}
-	pagination := b.sc.GetUsersPaginated(slack.GetUsersOptionLimit(200))
-	for {
-		var err error
-		pagination, err = pagination.Next(context.Background())
-		if err != nil {
-			if pagination.Done(err) {
-				break
-			}
-
-			if err = b.handleRateLimit(err); err != nil {
-				b.Log.Errorf("Could not retrieve users: %#v", err)
-				return
-			}
-			continue
-		}
-
-		for i := range pagination.Users {
-			newUsers[pagination.Users[i].ID] = &pagination.Users[i]
-		}
-	}
-
-	b.usersMutex.Lock()
-	defer b.usersMutex.Unlock()
-	b.users = newUsers
-
-	b.refreshMutex.Lock()
-	defer b.refreshMutex.Unlock()
-	b.earliestUserRefresh = time.Now().Add(minimumRefreshInterval)
-	b.refreshInProgress = false
-}
-
-func (b *Bslack) populateChannels() {
-	b.refreshMutex.Lock()
-	if time.Now().Before(b.earliestChannelRefresh) || b.refreshInProgress {
-		b.Log.Debugf("Not refreshing channel list as it was done less than %v seconds ago.",
-			minimumRefreshInterval)
-		b.refreshMutex.Unlock()
-		return
-	}
-	b.refreshInProgress = true
-	b.refreshMutex.Unlock()
-
-	newChannelsByID := map[string]*slack.Channel{}
-	newChannelsByName := map[string]*slack.Channel{}
-
-	// We only retrieve public and private channels, not IMs
-	// and MPIMs as those do not have a channel name.
-	queryParams := &slack.GetConversationsParameters{
-		ExcludeArchived: "true",
-		Types:           []string{"public_channel,private_channel"},
-	}
-	for {
-		channels, nextCursor, err := b.sc.GetConversations(queryParams)
-		if err != nil {
-			if err = b.handleRateLimit(err); err != nil {
-				b.Log.Errorf("Could not retrieve channels: %#v", err)
-				return
-			}
-			continue
-		}
-
-		for i := range channels {
-			newChannelsByID[channels[i].ID] = &channels[i]
-			newChannelsByName[channels[i].Name] = &channels[i]
-		}
-		if nextCursor == "" {
-			break
-		}
-		queryParams.Cursor = nextCursor
-	}
-
-	b.channelsMutex.Lock()
-	defer b.channelsMutex.Unlock()
-	b.channelsByID = newChannelsByID
-	b.channelsByName = newChannelsByName
-
-	b.refreshMutex.Lock()
-	defer b.refreshMutex.Unlock()
-	b.earliestChannelRefresh = time.Now().Add(minimumRefreshInterval)
-	b.refreshInProgress = false
-}
 
 // populateReceivedMessage shapes the initial Matterbridge message that we will forward to the
 // router before we apply message-dependent modifications.
 func (b *Bslack) populateReceivedMessage(ev *slack.MessageEvent) (*config.Message, error) {
 	// Use our own func because rtm.GetChannelInfo doesn't work for private channels.
-	channel, err := b.getChannelByID(ev.Channel)
+	channel, err := b.channels.getChannelByID(ev.Channel)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +40,13 @@ func (b *Bslack) populateReceivedMessage(ev *slack.MessageEvent) (*config.Messag
 			b.Log.Debugf("SubMessage %#v", ev.SubMessage)
 			rmsg.Text = ev.SubMessage.Text + b.GetString(editSuffixConfig)
 		}
+	}
+
+	// For edits, only submessage has thread ts.
+	// Ensures edits to threaded messages maintain their prefix hint on the
+	// unthreaded end.
+	if ev.SubMessage != nil {
+		rmsg.ParentID = ev.SubMessage.ThreadTimestamp
 	}
 
 	if err = b.populateMessageWithUserInfo(ev, rmsg); err != nil {
@@ -219,7 +77,7 @@ func (b *Bslack) populateMessageWithUserInfo(ev *slack.MessageEvent, rmsg *confi
 		return nil
 	}
 
-	user := b.getUser(userID)
+	user := b.users.getUser(userID)
 	if user == nil {
 		return fmt.Errorf("could not find information for user with id %s", ev.User)
 	}
@@ -245,13 +103,14 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 			break
 		}
 
-		if err = b.handleRateLimit(err); err != nil {
+		if err = handleRateLimit(b.Log, err); err != nil {
 			b.Log.Errorf("Could not retrieve bot information: %#v", err)
 			return err
 		}
 	}
+	b.Log.Debugf("Found bot %#v", bot)
 
-	if bot.Name != "" && bot.Name != "Slack API Tester" {
+	if bot.Name != "" {
 		rmsg.Username = bot.Name
 		if ev.Username != "" {
 			rmsg.Username = ev.Username
@@ -262,17 +121,34 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 }
 
 var (
-	mentionRE  = regexp.MustCompile(`<@([a-zA-Z0-9]+)>`)
-	channelRE  = regexp.MustCompile(`<#[a-zA-Z0-9]+\|(.+?)>`)
-	variableRE = regexp.MustCompile(`<!((?:subteam\^)?[a-zA-Z0-9]+)(?:\|@?(.+?))?>`)
-	urlRE      = regexp.MustCompile(`<(.*?)(\|.*?)?>`)
+	mentionRE        = regexp.MustCompile(`<@([a-zA-Z0-9]+)>`)
+	channelRE        = regexp.MustCompile(`<#[a-zA-Z0-9]+\|(.+?)>`)
+	variableRE       = regexp.MustCompile(`<!((?:subteam\^)?[a-zA-Z0-9]+)(?:\|@?(.+?))?>`)
+	urlRE            = regexp.MustCompile(`<(.*?)(\|.*?)?>`)
+	codeFenceRE      = regexp.MustCompile(`(?m)^` + "```" + `\w+$`)
+	topicOrPurposeRE = regexp.MustCompile(`(?s)(@.+) (cleared|set)(?: the)? channel (topic|purpose)(?:: (.*))?`)
 )
+
+func (b *Bslack) extractTopicOrPurpose(text string) (string, string) {
+	r := topicOrPurposeRE.FindStringSubmatch(text)
+	if len(r) == 5 {
+		action, updateType, extracted := r[2], r[3], r[4]
+		switch action {
+		case "set":
+			return updateType, extracted
+		case "cleared":
+			return updateType, ""
+		}
+	}
+	b.Log.Warnf("Encountered channel topic or purpose change message with unexpected format: %s", text)
+	return "unknown", ""
+}
 
 // @see https://api.slack.com/docs/message-formatting#linking_to_channels_and_users
 func (b *Bslack) replaceMention(text string) string {
 	replaceFunc := func(match string) string {
 		userID := strings.Trim(match, "@<>")
-		if username := b.getUsername(userID); userID != "" {
+		if username := b.users.getUsername(userID); userID != "" {
 			return "@" + username
 		}
 		return match
@@ -312,12 +188,72 @@ func (b *Bslack) replaceURL(text string) string {
 	return text
 }
 
-func (b *Bslack) handleRateLimit(err error) error {
+func (b *Bslack) replaceb0rkedMarkDown(text string) string {
+	// taken from https://github.com/mattermost/mattermost-server/blob/master/app/slackimport.go
+	//
+	regexReplaceAllString := []struct {
+		regex *regexp.Regexp
+		rpl   string
+	}{
+		// bold
+		{
+			regexp.MustCompile(`(^|[\s.;,])\*(\S[^*\n]+)\*`),
+			"$1**$2**",
+		},
+		// strikethrough
+		{
+			regexp.MustCompile(`(^|[\s.;,])\~(\S[^~\n]+)\~`),
+			"$1~~$2~~",
+		},
+		// single paragraph blockquote
+		// Slack converts > character to &gt;
+		{
+			regexp.MustCompile(`(?sm)^&gt;`),
+			">",
+		},
+	}
+	for _, rule := range regexReplaceAllString {
+		text = rule.regex.ReplaceAllString(text, rule.rpl)
+	}
+	return text
+}
+
+func (b *Bslack) replaceCodeFence(text string) string {
+	return codeFenceRE.ReplaceAllString(text, "```")
+}
+
+// getUsersInConversation returns an array of userIDs that are members of channelID
+func (b *Bslack) getUsersInConversation(channelID string) ([]string, error) {
+	channelMembers := []string{}
+	for {
+		queryParams := &slack.GetUsersInConversationParameters{
+			ChannelID: channelID,
+		}
+
+		members, nextCursor, err := b.sc.GetUsersInConversation(queryParams)
+		if err != nil {
+			if err = handleRateLimit(b.Log, err); err != nil {
+				return channelMembers, fmt.Errorf("Could not retrieve users in channels: %#v", err)
+			}
+			continue
+		}
+
+		channelMembers = append(channelMembers, members...)
+
+		if nextCursor == "" {
+			break
+		}
+		queryParams.Cursor = nextCursor
+	}
+	return channelMembers, nil
+}
+
+func handleRateLimit(log *logrus.Entry, err error) error {
 	rateLimit, ok := err.(*slack.RateLimitedError)
 	if !ok {
 		return err
 	}
-	b.Log.Infof("Rate-limited by Slack. Sleeping for %v", rateLimit.RetryAfter)
+	log.Infof("Rate-limited by Slack. Sleeping for %v", rateLimit.RetryAfter)
 	time.Sleep(rateLimit.RetryAfter)
 	return nil
 }

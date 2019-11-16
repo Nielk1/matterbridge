@@ -3,6 +3,7 @@ package bmatrix
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"mime"
 	"regexp"
 	"strings"
@@ -19,11 +20,13 @@ type Bmatrix struct {
 	UserID  string
 	RoomMap map[string]string
 	sync.RWMutex
+	htmlTag *regexp.Regexp
 	*bridge.Config
 }
 
 func New(cfg *bridge.Config) bridge.Bridger {
 	b := &Bmatrix{Config: cfg}
+	b.htmlTag = regexp.MustCompile("</.*?>")
 	b.RoomMap = make(map[string]string)
 	return b
 }
@@ -99,19 +102,35 @@ func (b *Bmatrix) Send(msg config.Message) (string, error) {
 	// Upload a file if it exists
 	if msg.Extra != nil {
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			b.mc.SendText(channel, rmsg.Username+rmsg.Text)
+			if _, err := b.mc.SendText(channel, rmsg.Username+rmsg.Text); err != nil {
+				b.Log.Errorf("sendText failed: %s", err)
+			}
 		}
 		// check if we have files to upload (from slack, telegram or mattermost)
 		if len(msg.Extra["file"]) > 0 {
-			return b.handleUploadFile(&msg, channel)
+			return b.handleUploadFiles(&msg, channel)
 		}
 	}
 
 	// Edit message if we have an ID
 	// matrix has no editing support
 
-	// Post normal message
-	resp, err := b.mc.SendText(channel, msg.Username+msg.Text)
+	// Use notices to send join/leave events
+	if msg.Event == config.EventJoinLeave {
+		resp, err := b.mc.SendNotice(channel, msg.Username+msg.Text)
+		if err != nil {
+			return "", err
+		}
+		return resp.EventID, err
+	}
+
+	username := html.EscapeString(msg.Username)
+	// check if we have a </tag>. if we have, we don't escape HTML. #696
+	if b.htmlTag.MatchString(msg.Username) {
+		username = msg.Username
+	}
+	// Post normal message with HTML support (eg riot.im)
+	resp, err := b.mc.SendHTML(channel, msg.Username+msg.Text, username+helper.ParseMarkdown(msg.Text))
 	if err != nil {
 		return "", err
 	}
@@ -257,45 +276,71 @@ func (b *Bmatrix) handleDownloadFile(rmsg *config.Message, content map[string]in
 	return nil
 }
 
-// handleUploadFile handles native upload of files
-func (b *Bmatrix) handleUploadFile(msg *config.Message, channel string) (string, error) {
+// handleUploadFiles handles native upload of files.
+func (b *Bmatrix) handleUploadFiles(msg *config.Message, channel string) (string, error) {
 	for _, f := range msg.Extra["file"] {
-		fi := f.(config.FileInfo)
-		content := bytes.NewReader(*fi.Data)
-		sp := strings.Split(fi.Name, ".")
-		mtype := mime.TypeByExtension("." + sp[len(sp)-1])
-		if strings.Contains(mtype, "image") ||
-			strings.Contains(mtype, "video") {
-			if fi.Comment != "" {
-				_, err := b.mc.SendText(channel, msg.Username+fi.Comment)
-				if err != nil {
-					b.Log.Errorf("file comment failed: %#v", err)
-				}
-			}
-			b.Log.Debugf("uploading file: %s %s", fi.Name, mtype)
-			res, err := b.mc.UploadToContentRepo(content, mtype, int64(len(*fi.Data)))
-			if err != nil {
-				b.Log.Errorf("file upload failed: %#v", err)
-				continue
-			}
-			if strings.Contains(mtype, "video") {
-				b.Log.Debugf("sendVideo %s", res.ContentURI)
-				_, err = b.mc.SendVideo(channel, fi.Name, res.ContentURI)
-				if err != nil {
-					b.Log.Errorf("sendVideo failed: %#v", err)
-				}
-			}
-			if strings.Contains(mtype, "image") {
-				b.Log.Debugf("sendImage %s", res.ContentURI)
-				_, err = b.mc.SendImage(channel, fi.Name, res.ContentURI)
-				if err != nil {
-					b.Log.Errorf("sendImage failed: %#v", err)
-				}
-			}
-			b.Log.Debugf("result: %#v", res)
+		if fi, ok := f.(config.FileInfo); ok {
+			b.handleUploadFile(msg, channel, &fi)
 		}
 	}
 	return "", nil
+}
+
+// handleUploadFile handles native upload of a file.
+func (b *Bmatrix) handleUploadFile(msg *config.Message, channel string, fi *config.FileInfo) {
+	content := bytes.NewReader(*fi.Data)
+	sp := strings.Split(fi.Name, ".")
+	mtype := mime.TypeByExtension("." + sp[len(sp)-1])
+	if !(strings.Contains(mtype, "image") || strings.Contains(mtype, "video") ||
+		strings.Contains(mtype, "application") || strings.Contains(mtype, "audio")) {
+		return
+	}
+	if fi.Comment != "" {
+		_, err := b.mc.SendText(channel, msg.Username+fi.Comment)
+		if err != nil {
+			b.Log.Errorf("file comment failed: %#v", err)
+		}
+	} else {
+		// image and video uploads send no username, we have to do this ourself here #715
+		_, err := b.mc.SendText(channel, msg.Username)
+		if err != nil {
+			b.Log.Errorf("file comment failed: %#v", err)
+		}
+	}
+	b.Log.Debugf("uploading file: %s %s", fi.Name, mtype)
+	res, err := b.mc.UploadToContentRepo(content, mtype, int64(len(*fi.Data)))
+	if err != nil {
+		b.Log.Errorf("file upload failed: %#v", err)
+		return
+	}
+
+	switch {
+	case strings.Contains(mtype, "video"):
+		b.Log.Debugf("sendVideo %s", res.ContentURI)
+		_, err = b.mc.SendVideo(channel, fi.Name, res.ContentURI)
+		if err != nil {
+			b.Log.Errorf("sendVideo failed: %#v", err)
+		}
+	case strings.Contains(mtype, "image"):
+		b.Log.Debugf("sendImage %s", res.ContentURI)
+		_, err = b.mc.SendImage(channel, fi.Name, res.ContentURI)
+		if err != nil {
+			b.Log.Errorf("sendImage failed: %#v", err)
+		}
+	case strings.Contains(mtype, "application"):
+		b.Log.Debugf("sendFile %s", res.ContentURI)
+		_, err = b.mc.SendFile(channel, fi.Name, res.ContentURI, mtype, uint(len(*fi.Data)))
+		if err != nil {
+			b.Log.Errorf("sendFile failed: %#v", err)
+		}
+	case strings.Contains(mtype, "audio"):
+		b.Log.Debugf("sendAudio %s", res.ContentURI)
+		_, err = b.mc.SendAudio(channel, fi.Name, res.ContentURI, mtype, uint(len(*fi.Data)))
+		if err != nil {
+			b.Log.Errorf("sendAudio failed: %#v", err)
+		}
+	}
+	b.Log.Debugf("result: %#v", res)
 }
 
 // skipMessages returns true if this message should not be handled

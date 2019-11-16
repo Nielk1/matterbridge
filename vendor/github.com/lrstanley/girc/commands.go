@@ -63,14 +63,14 @@ func (cmd *Commands) Part(channels ...string) {
 
 // PartMessage leaves an IRC channel with a specified leave message.
 func (cmd *Commands) PartMessage(channel, message string) {
-	cmd.c.Send(&Event{Command: PART, Params: []string{channel}, Trailing: message, EmptyTrailing: true})
+	cmd.c.Send(&Event{Command: PART, Params: []string{channel, message}})
 }
 
 // SendCTCP sends a CTCP request to target. Note that this method uses
 // PRIVMSG specifically. ctcpType is the CTCP command, e.g. "FINGER", "TIME",
 // "VERSION", etc.
 func (cmd *Commands) SendCTCP(target, ctcpType, message string) {
-	out := encodeCTCPRaw(ctcpType, message)
+	out := EncodeCTCPRaw(ctcpType, message)
 	if out == "" {
 		panic(fmt.Sprintf("invalid CTCP: %s -> %s: %s", target, ctcpType, message))
 	}
@@ -95,7 +95,7 @@ func (cmd *Commands) SendCTCPReplyf(target, ctcpType, format string, a ...interf
 // SendCTCPReply sends a CTCP response to target. Note that this method uses
 // NOTICE specifically.
 func (cmd *Commands) SendCTCPReply(target, ctcpType, message string) {
-	out := encodeCTCPRaw(ctcpType, message)
+	out := EncodeCTCPRaw(ctcpType, message)
 	if out == "" {
 		panic(fmt.Sprintf("invalid CTCP: %s -> %s: %s", target, ctcpType, message))
 	}
@@ -105,7 +105,7 @@ func (cmd *Commands) SendCTCPReply(target, ctcpType, message string) {
 
 // Message sends a PRIVMSG to target (either channel, service, or user).
 func (cmd *Commands) Message(target, message string) {
-	cmd.c.Send(&Event{Command: PRIVMSG, Params: []string{target}, Trailing: message, EmptyTrailing: true})
+	cmd.c.Send(&Event{Command: PRIVMSG, Params: []string{target, message}})
 }
 
 // Messagef sends a formated PRIVMSG to target (either channel, service, or
@@ -171,9 +171,8 @@ func (cmd *Commands) ReplyTof(event Event, format string, a ...interface{}) {
 // or user).
 func (cmd *Commands) Action(target, message string) {
 	cmd.c.Send(&Event{
-		Command:  PRIVMSG,
-		Params:   []string{target},
-		Trailing: fmt.Sprintf("\001ACTION %s\001", message),
+		Command: PRIVMSG,
+		Params:  []string{target, fmt.Sprintf("\001ACTION %s\001", message)},
 	})
 }
 
@@ -185,7 +184,7 @@ func (cmd *Commands) Actionf(target, format string, a ...interface{}) {
 
 // Notice sends a NOTICE to target (either channel, service, or user).
 func (cmd *Commands) Notice(target, message string) {
-	cmd.c.Send(&Event{Command: NOTICE, Params: []string{target}, Trailing: message, EmptyTrailing: true})
+	cmd.c.Send(&Event{Command: NOTICE, Params: []string{target, message}})
 }
 
 // Noticef sends a formated NOTICE to target (either channel, service, or
@@ -221,7 +220,7 @@ func (cmd *Commands) SendRawf(format string, a ...interface{}) error {
 // Topic sets the topic of channel to message. Does not verify the length
 // of the topic.
 func (cmd *Commands) Topic(channel, message string) {
-	cmd.c.Send(&Event{Command: TOPIC, Params: []string{channel}, Trailing: message, EmptyTrailing: true})
+	cmd.c.Send(&Event{Command: TOPIC, Params: []string{channel, message}})
 }
 
 // Who sends a WHO query to the server, which will attempt WHOX by default.
@@ -266,7 +265,7 @@ func (cmd *Commands) Oper(user, pass string) {
 // server.
 func (cmd *Commands) Kick(channel, user, reason string) {
 	if reason != "" {
-		cmd.c.Send(&Event{Command: KICK, Params: []string{channel, user}, Trailing: reason, EmptyTrailing: true})
+		cmd.c.Send(&Event{Command: KICK, Params: []string{channel, user, reason}})
 	}
 
 	cmd.c.Send(&Event{Command: KICK, Params: []string{channel, user}})
@@ -358,4 +357,10 @@ func (cmd *Commands) List(channels ...string) {
 // you want back.
 func (cmd *Commands) Whowas(user string, amount int) {
 	cmd.c.Send(&Event{Command: WHOWAS, Params: []string{user, string(amount)}})
+}
+
+// Monitor sends a MONITOR query to the server. The results of the query
+// depends on the given modifier, see https://ircv3.net/specs/core/monitor-3.2.html
+func (cmd *Commands) Monitor(modifier rune, args ...string) {
+	cmd.c.Send(&Event{Command: MONITOR, Params: append([]string{string(modifier)}, args...)})
 }

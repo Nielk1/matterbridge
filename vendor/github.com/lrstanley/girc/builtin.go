@@ -93,7 +93,11 @@ func handleConnect(c *Client, e Event) {
 	}
 
 	time.Sleep(2 * time.Second)
-	c.RunHandlers(&Event{Command: CONNECTED, Trailing: c.Server()})
+
+	c.mu.RLock()
+	server := c.server()
+	c.mu.RUnlock()
+	c.RunHandlers(&Event{Command: CONNECTED, Params: []string{server}})
 }
 
 // nickCollisionHandler helps prevent the client from having conflicting
@@ -109,7 +113,7 @@ func nickCollisionHandler(c *Client, e Event) {
 
 // handlePING helps respond to ping requests from the server.
 func handlePING(c *Client, e Event) {
-	c.Cmd.Pong(e.Trailing)
+	c.Cmd.Pong(e.Last())
 }
 
 func handlePONG(c *Client, e Event) {
@@ -120,16 +124,11 @@ func handlePONG(c *Client, e Event) {
 
 // handleJOIN ensures that the state has updated users and channels.
 func handleJOIN(c *Client, e Event) {
-	if e.Source == nil {
+	if e.Source == nil || len(e.Params) == 0 {
 		return
 	}
 
-	var channelName string
-	if len(e.Params) > 0 {
-		channelName = e.Params[0]
-	} else {
-		channelName = e.Trailing
-	}
+	channelName := e.Params[0]
 
 	c.state.Lock()
 
@@ -145,7 +144,7 @@ func handleJOIN(c *Client, e Event) {
 
 	user := c.state.lookupUser(e.Source.Name)
 	if user == nil {
-		if ok := c.state.createUser(e.Source.Name); !ok {
+		if ok := c.state.createUser(e.Source); !ok {
 			c.state.Unlock()
 			return
 		}
@@ -158,18 +157,18 @@ func handleJOIN(c *Client, e Event) {
 	user.addChannel(channel.Name)
 
 	// Assume extended-join (ircv3).
-	if len(e.Params) == 2 {
+	if len(e.Params) >= 2 {
 		if e.Params[1] != "*" {
 			user.Extras.Account = e.Params[1]
 		}
 
-		if len(e.Trailing) > 0 {
-			user.Extras.Name = e.Trailing
+		if len(e.Params) > 2 {
+			user.Extras.Name = e.Params[2]
 		}
 	}
 	c.state.Unlock()
 
-	if e.Source.Name == c.GetNick() {
+	if e.Source.ID() == c.GetID() {
 		// If it's us, don't just add our user to the list. Run a WHO which
 		// will tell us who exactly is in the entire channel.
 		c.Send(&Event{Command: WHO, Params: []string{channelName, "%tacuhnr,1"}})
@@ -192,16 +191,13 @@ func handleJOIN(c *Client, e Event) {
 
 // handlePART ensures that the state is clean of old user and channel entries.
 func handlePART(c *Client, e Event) {
-	if e.Source == nil {
+	if e.Source == nil || len(e.Params) < 1 {
 		return
 	}
 
-	var channel string
-	if len(e.Params) > 0 {
-		channel = e.Params[0]
-	} else {
-		channel = e.Trailing
-	}
+	// TODO: does this work if it's not the bot?
+
+	channel := e.Params[0]
 
 	if channel == "" {
 		return
@@ -209,7 +205,7 @@ func handlePART(c *Client, e Event) {
 
 	defer c.state.notify(c, UPDATE_STATE)
 
-	if e.Source.Name == c.GetNick() {
+	if e.Source.ID() == c.GetID() {
 		c.state.Lock()
 		c.state.deleteChannel(channel)
 		c.state.Unlock()
@@ -217,7 +213,7 @@ func handlePART(c *Client, e Event) {
 	}
 
 	c.state.Lock()
-	c.state.deleteUser(channel, e.Source.Name)
+	c.state.deleteUser(channel, e.Source.ID())
 	c.state.Unlock()
 }
 
@@ -231,7 +227,7 @@ func handleTOPIC(c *Client, e Event) {
 	case 1:
 		name = e.Params[0]
 	default:
-		name = e.Params[len(e.Params)-1]
+		name = e.Params[1]
 	}
 
 	c.state.Lock()
@@ -241,7 +237,7 @@ func handleTOPIC(c *Client, e Event) {
 		return
 	}
 
-	channel.Topic = e.Trailing
+	channel.Topic = e.Last()
 	c.state.Unlock()
 	c.state.notify(c, UPDATE_STATE)
 }
@@ -253,7 +249,7 @@ func handleWHO(c *Client, e Event) {
 
 	// Assume WHOX related.
 	if e.Command == RPL_WHOSPCRPL {
-		if len(e.Params) != 7 {
+		if len(e.Params) != 8 {
 			// Assume there was some form of error or invalid WHOX response.
 			return
 		}
@@ -266,12 +262,24 @@ func handleWHO(c *Client, e Event) {
 		}
 
 		ident, host, nick, account = e.Params[3], e.Params[4], e.Params[5], e.Params[6]
-		realname = e.Trailing
+		realname = e.Last()
 	} else {
 		// Assume RPL_WHOREPLY.
-		ident, host, nick = e.Params[2], e.Params[3], e.Params[5]
-		if len(e.Trailing) > 2 {
-			realname = e.Trailing[2:]
+		// format: "<client> <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <real_name>"
+		ident, host, nick, realname = e.Params[2], e.Params[3], e.Params[5], e.Last()
+
+		// Strip the numbers from "<hopcount> <realname>"
+		for i := 0; i < len(realname); i++ {
+			// Check if it's not 0-9.
+			if realname[i] < 0x30 || i > 0x39 {
+				realname = strings.TrimLeft(realname[i+1:], " ")
+				break
+			}
+
+			if i == len(realname)-1 {
+				// Assume it's only numbers?
+				realname = ""
+			}
 		}
 	}
 
@@ -326,10 +334,8 @@ func handleNICK(c *Client, e Event) {
 
 	c.state.Lock()
 	// renameUser updates the LastActive time automatically.
-	if len(e.Params) == 1 {
-		c.state.renameUser(e.Source.Name, e.Params[0])
-	} else if len(e.Trailing) > 0 {
-		c.state.renameUser(e.Source.Name, e.Trailing)
+	if len(e.Params) >= 1 {
+		c.state.renameUser(e.Source.ID(), e.Last())
 	}
 	c.state.Unlock()
 	c.state.notify(c, UPDATE_STATE)
@@ -341,12 +347,12 @@ func handleQUIT(c *Client, e Event) {
 		return
 	}
 
-	if e.Source.Name == c.GetNick() {
+	if e.Source.ID() == c.GetID() {
 		return
 	}
 
 	c.state.Lock()
-	c.state.deleteUser("", e.Source.Name)
+	c.state.deleteUser("", e.Source.ID())
 	c.state.Unlock()
 	c.state.notify(c, UPDATE_STATE)
 }
@@ -372,12 +378,10 @@ func handleMYINFO(c *Client, e Event) {
 // events. These commonly contain the server capabilities and limitations.
 // For example, things like max channel name length, or nickname length.
 func handleISUPPORT(c *Client, e Event) {
-	// Must be a ISUPPORT-based message. 005 is also used for server bounce
-	// related things, so this handler may be triggered during other
-	// situations.
+	// Must be a ISUPPORT-based message.
 
 	// Also known as RPL_PROTOCTL.
-	if !strings.HasSuffix(e.Trailing, "this server") {
+	if !strings.HasSuffix(e.Last(), "this server") {
 		return
 	}
 
@@ -387,8 +391,8 @@ func handleISUPPORT(c *Client, e Event) {
 	}
 
 	c.state.Lock()
-	// Skip the first parameter, as it's our nickname.
-	for i := 1; i < len(e.Params); i++ {
+	// Skip the first parameter, as it's our nickname, and the last, as it's the doc.
+	for i := 1; i < len(e.Params)-1; i++ {
 		j := strings.IndexByte(e.Params[i], '=')
 
 		if j < 1 || (j+1) == len(e.Params[i]) {
@@ -421,10 +425,9 @@ func handleMOTD(c *Client, e Event) {
 
 	// Otherwise, assume we're getting sent the MOTD line-by-line.
 	if len(c.state.motd) != 0 {
-		e.Trailing = "\n" + e.Trailing
+		c.state.motd += "\n"
 	}
-
-	c.state.motd += e.Trailing
+	c.state.motd += e.Last()
 	c.state.Unlock()
 }
 
@@ -436,15 +439,16 @@ func handleNAMES(c *Client, e Event) {
 		return
 	}
 
-	channel := c.state.lookupChannel(e.Params[len(e.Params)-1])
+	channel := c.state.lookupChannel(e.Params[2])
 	if channel == nil {
 		return
 	}
 
-	parts := strings.Split(e.Trailing, " ")
+	parts := strings.Split(e.Last(), " ")
 
-	var host, ident, modes, nick string
+	var modes, nick string
 	var ok bool
+	s := &Source{}
 
 	c.state.Lock()
 	for i := 0; i < len(parts); i++ {
@@ -455,36 +459,29 @@ func handleNAMES(c *Client, e Event) {
 
 		// If userhost-in-names.
 		if strings.Contains(nick, "@") {
-			s := ParseSource(nick)
+			s = ParseSource(nick)
 			if s == nil {
 				continue
 			}
 
-			host = s.Host
-			nick = s.Name
-			ident = s.Ident
+		} else {
+			s = &Source{
+				Name: nick,
+			}
+
+			if !IsValidNick(s.Name) {
+				continue
+			}
 		}
 
-		if !IsValidNick(nick) {
-			continue
-		}
-
-		c.state.createUser(nick)
-		user := c.state.lookupUser(nick)
+		c.state.createUser(s)
+		user := c.state.lookupUser(s.Name)
 		if user == nil {
 			continue
 		}
 
 		user.addChannel(channel.Name)
-		channel.addUser(nick)
-
-		// Add necessary userhost-in-names data into the user.
-		if host != "" {
-			user.Host = host
-		}
-		if ident != "" {
-			user.Ident = ident
-		}
+		channel.addUser(s.ID())
 
 		// Don't append modes, overwrite them.
 		perms, _ := user.Perms.Lookup(channel.Name)

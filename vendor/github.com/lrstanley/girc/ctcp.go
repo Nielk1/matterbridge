@@ -30,27 +30,31 @@ type CTCPEvent struct {
 	Reply bool `json:"reply"`
 }
 
-// decodeCTCP decodes an incoming CTCP event, if it is CTCP. nil is returned
-// if the incoming event does not match a valid CTCP.
-func decodeCTCP(e *Event) *CTCPEvent {
+// DecodeCTCP decodes an incoming CTCP event, if it is CTCP. nil is returned
+// if the incoming event does not have valid CTCP encoding.
+func DecodeCTCP(e *Event) *CTCPEvent {
 	// http://www.irchelp.org/protocol/ctcpspec.html
+
+	if e == nil {
+		return nil
+	}
 
 	// Must be targeting a user/channel, AND trailing must have
 	// DELIM+TAG+DELIM minimum (at least 3 chars).
-	if len(e.Params) != 1 || len(e.Trailing) < 3 {
+	if len(e.Params) != 2 || len(e.Params[1]) < 3 {
 		return nil
 	}
 
-	if (e.Command != PRIVMSG && e.Command != NOTICE) || !IsValidNick(e.Params[0]) {
+	if e.Command != PRIVMSG && e.Command != NOTICE {
 		return nil
 	}
 
-	if e.Trailing[0] != ctcpDelim || e.Trailing[len(e.Trailing)-1] != ctcpDelim {
+	if e.Params[1][0] != ctcpDelim || e.Params[1][len(e.Params[1])-1] != ctcpDelim {
 		return nil
 	}
 
 	// Strip delimiters.
-	text := e.Trailing[1 : len(e.Trailing)-1]
+	text := e.Params[1][1 : len(e.Params[1])-1]
 
 	s := strings.IndexByte(text, eventSpace)
 
@@ -88,18 +92,18 @@ func decodeCTCP(e *Event) *CTCPEvent {
 	}
 }
 
-// encodeCTCP encodes a CTCP event into a string, including delimiters.
-func encodeCTCP(ctcp *CTCPEvent) (out string) {
+// EncodeCTCP encodes a CTCP event into a string, including delimiters.
+func EncodeCTCP(ctcp *CTCPEvent) (out string) {
 	if ctcp == nil {
 		return ""
 	}
 
-	return encodeCTCPRaw(ctcp.Command, ctcp.Text)
+	return EncodeCTCPRaw(ctcp.Command, ctcp.Text)
 }
 
-// encodeCTCPRaw is much like encodeCTCP, however accepts a raw command and
+// EncodeCTCPRaw is much like EncodeCTCP, however accepts a raw command and
 // string as input.
-func encodeCTCPRaw(cmd, text string) (out string) {
+func EncodeCTCPRaw(cmd, text string) (out string) {
 	if len(cmd) <= 0 {
 		return ""
 	}
@@ -145,9 +149,14 @@ func (c *CTCP) call(client *Client, event *CTCPEvent) {
 	}
 
 	if _, ok := c.handlers[event.Command]; !ok {
+		// If ACTION, don't do anything.
+		if event.Command == CTCP_ACTION {
+			return
+		}
+
 		// Send a ERRMSG reply, if we know who sent it.
-		if event.Source != nil && IsValidNick(event.Source.Name) {
-			client.Cmd.SendCTCPReply(event.Source.Name, CTCP_ERRMSG, "that is an unknown CTCP query")
+		if event.Source != nil && IsValidNick(event.Source.ID()) {
+			client.Cmd.SendCTCPReply(event.Source.ID(), CTCP_ERRMSG, "that is an unknown CTCP query")
 		}
 		return
 	}
@@ -239,7 +248,7 @@ func handleCTCPPing(client *Client, ctcp CTCPEvent) {
 	if ctcp.Reply {
 		return
 	}
-	client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_PING, ctcp.Text)
+	client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_PING, ctcp.Text)
 }
 
 // handleCTCPPong replies with a pong.
@@ -247,7 +256,7 @@ func handleCTCPPong(client *Client, ctcp CTCPEvent) {
 	if ctcp.Reply {
 		return
 	}
-	client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_PONG, "")
+	client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_PONG, "")
 }
 
 // handleCTCPVersion replies with the name of the client, Go version, as well
@@ -255,12 +264,12 @@ func handleCTCPPong(client *Client, ctcp CTCPEvent) {
 // arm, etc).
 func handleCTCPVersion(client *Client, ctcp CTCPEvent) {
 	if client.Config.Version != "" {
-		client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_VERSION, client.Config.Version)
+		client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_VERSION, client.Config.Version)
 		return
 	}
 
 	client.Cmd.SendCTCPReplyf(
-		ctcp.Source.Name, CTCP_VERSION,
+		ctcp.Source.ID(), CTCP_VERSION,
 		"girc (github.com/lrstanley/girc) using %s (%s, %s)",
 		runtime.Version(), runtime.GOOS, runtime.GOARCH,
 	)
@@ -268,13 +277,13 @@ func handleCTCPVersion(client *Client, ctcp CTCPEvent) {
 
 // handleCTCPSource replies with the public git location of this library.
 func handleCTCPSource(client *Client, ctcp CTCPEvent) {
-	client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_SOURCE, "https://github.com/lrstanley/girc")
+	client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_SOURCE, "https://github.com/lrstanley/girc")
 }
 
 // handleCTCPTime replies with a RFC 1123 (Z) formatted version of Go's
 // local time.
 func handleCTCPTime(client *Client, ctcp CTCPEvent) {
-	client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_TIME, ":"+time.Now().Format(time.RFC1123Z))
+	client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_TIME, ":"+time.Now().Format(time.RFC1123Z))
 }
 
 // handleCTCPFinger replies with the realname and idle time of the user. This
@@ -284,5 +293,5 @@ func handleCTCPFinger(client *Client, ctcp CTCPEvent) {
 	active := client.conn.lastActive
 	client.conn.mu.RUnlock()
 
-	client.Cmd.SendCTCPReply(ctcp.Source.Name, CTCP_FINGER, fmt.Sprintf("%s -- idle %s", client.Config.Name, time.Since(active)))
+	client.Cmd.SendCTCPReply(ctcp.Source.ID(), CTCP_FINGER, fmt.Sprintf("%s -- idle %s", client.Config.Name, time.Since(active)))
 }

@@ -6,6 +6,7 @@ package girc
 
 // Standard CTCP based constants.
 const (
+	CTCP_ACTION     = "ACTION"
 	CTCP_PING       = "PING"
 	CTCP_PONG       = "PONG"
 	CTCP_VERSION    = "VERSION"
@@ -20,13 +21,15 @@ const (
 // Emulated event commands used to allow easier hooks into the changing
 // state of the client.
 const (
-	UPDATE_STATE   = "CLIENT_STATE_UPDATED"   // when channel/user state is updated.
-	UPDATE_GENERAL = "CLIENT_GENERAL_UPDATED" // when general state (client nick, server name, etc) is updated.
-	ALL_EVENTS     = "*"                      // trigger on all events
-	CONNECTED      = "CLIENT_CONNECTED"       // when it's safe to send arbitrary commands (joins, list, who, etc), trailing is host:port
-	INITIALIZED    = "CLIENT_INIT"            // verifies successful socket connection, trailing is host:port
-	DISCONNECTED   = "CLIENT_DISCONNECTED"    // occurs when we're disconnected from the server (user-requested or not)
-	STOPPED        = "CLIENT_STOPPED"         // occurs when Client.Stop() has been called
+	UPDATE_STATE     = "CLIENT_STATE_UPDATED"   // when channel/user state is updated.
+	UPDATE_GENERAL   = "CLIENT_GENERAL_UPDATED" // when general state (client nick, server name, etc) is updated.
+	ALL_EVENTS       = "*"                      // trigger on all events
+	CONNECTED        = "CLIENT_CONNECTED"       // when it's safe to send arbitrary commands (joins, list, who, etc), trailing is host:port
+	INITIALIZED      = "CLIENT_INIT"            // verifies successful socket connection, trailing is host:port
+	DISCONNECTED     = "CLIENT_DISCONNECTED"    // occurs when we're disconnected from the server (user-requested or not)
+	CLOSED           = "CLIENT_CLOSED"          // occurs when Client.Close() has been called
+	STS_UPGRADE_INIT = "STS_UPGRADE_INIT"       // when an STS upgrade initially happens.
+	STS_ERR_FALLBACK = "STS_ERR_FALLBACK"       // when an STS connection fails and fallbacks are supported.
 )
 
 // User/channel prefixes :: RFC1459.
@@ -117,6 +120,7 @@ const (
 	USERS    = "USERS"
 	VERSION  = "VERSION"
 	WALLOPS  = "WALLOPS"
+	WEBIRC   = "WEBIRC"
 	WHO      = "WHO"
 	WHOIS    = "WHOIS"
 	WHOWAS   = "WHOWAS"
@@ -223,6 +227,7 @@ const (
 	ERR_NOTOPLEVEL        = "413"
 	ERR_WILDTOPLEVEL      = "414"
 	ERR_BADMASK           = "415"
+	ERR_INPUTTOOLONG      = "417"
 	ERR_UNKNOWNCOMMAND    = "421"
 	ERR_NOMOTD            = "422"
 	ERR_NOADMININFO       = "423"
@@ -267,6 +272,7 @@ const (
 // IRCv3 commands and extensions :: http://ircv3.net/irc/.
 const (
 	AUTHENTICATE = "AUTHENTICATE"
+	MONITOR      = "MONITOR"
 	STARTTLS     = "STARTTLS"
 
 	CAP       = "CAP"
@@ -283,21 +289,27 @@ const (
 	CAP_CHGHOST = "CHGHOST"
 	CAP_AWAY    = "AWAY"
 	CAP_ACCOUNT = "ACCOUNT"
+	CAP_TAGMSG  = "TAGMSG"
 )
 
 // Numeric IRC reply mapping for ircv3 :: http://ircv3.net/irc/.
 const (
-	RPL_LOGGEDIN    = "900"
-	RPL_LOGGEDOUT   = "901"
-	RPL_NICKLOCKED  = "902"
-	RPL_SASLSUCCESS = "903"
-	ERR_SASLFAIL    = "904"
-	ERR_SASLTOOLONG = "905"
-	ERR_SASLABORTED = "906"
-	ERR_SASLALREADY = "907"
-	RPL_SASLMECHS   = "908"
-	RPL_STARTTLS    = "670"
-	ERR_STARTTLS    = "691"
+	RPL_LOGGEDIN     = "900"
+	RPL_LOGGEDOUT    = "901"
+	RPL_NICKLOCKED   = "902"
+	RPL_SASLSUCCESS  = "903"
+	ERR_SASLFAIL     = "904"
+	ERR_SASLTOOLONG  = "905"
+	ERR_SASLABORTED  = "906"
+	ERR_SASLALREADY  = "907"
+	RPL_SASLMECHS    = "908"
+	RPL_STARTTLS     = "670"
+	ERR_STARTTLS     = "691"
+	RPL_MONONLINE    = "730"
+	RPL_MONOFFLINE   = "731"
+	RPL_MONLIST      = "732"
+	RPL_ENDOFMONLIST = "733"
+	ERR_MONLISTFULL  = "734"
 )
 
 // Numeric IRC event mapping :: RFC2812; section 5.3.

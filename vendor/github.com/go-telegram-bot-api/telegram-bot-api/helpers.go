@@ -1,7 +1,6 @@
 package tgbotapi
 
 import (
-	"log"
 	"net/url"
 )
 
@@ -14,11 +13,12 @@ func NewMessage(chatID int64, text string) MessageConfig {
 			ChatID:           chatID,
 			ReplyToMessageID: 0,
 		},
-		Text: text,
+		Text:                  text,
 		DisableWebPagePreview: false,
 	}
 }
 
+// NewDeleteMessage creates a request to delete a message.
 func NewDeleteMessage(chatID int64, messageID int) DeleteMessageConfig {
 	return DeleteMessageConfig{
 		ChatID:    chatID,
@@ -201,6 +201,35 @@ func NewVideoShare(chatID int64, fileID string) VideoConfig {
 	}
 }
 
+// NewAnimationUpload creates a new animation uploader.
+//
+// chatID is where to send it, file is a string path to the file,
+// FileReader, or FileBytes.
+func NewAnimationUpload(chatID int64, file interface{}) AnimationConfig {
+	return AnimationConfig{
+		BaseFile: BaseFile{
+			BaseChat:    BaseChat{ChatID: chatID},
+			File:        file,
+			UseExisting: false,
+		},
+	}
+}
+
+// NewAnimationShare shares an existing animation.
+// You may use this to reshare an existing animation without reuploading it.
+//
+// chatID is where to send it, fileID is the ID of the animation
+// already uploaded.
+func NewAnimationShare(chatID int64, fileID string) AnimationConfig {
+	return AnimationConfig{
+		BaseFile: BaseFile{
+			BaseChat:    BaseChat{ChatID: chatID},
+			FileID:      fileID,
+			UseExisting: true,
+		},
+	}
+}
+
 // NewVideoNoteUpload creates a new video note uploader.
 //
 // chatID is where to send it, file is a string path to the file,
@@ -258,6 +287,33 @@ func NewVoiceShare(chatID int64, fileID string) VoiceConfig {
 			FileID:      fileID,
 			UseExisting: true,
 		},
+	}
+}
+
+// NewMediaGroup creates a new media group. Files should be an array of
+// two to ten InputMediaPhoto or InputMediaVideo.
+func NewMediaGroup(chatID int64, files []interface{}) MediaGroupConfig {
+	return MediaGroupConfig{
+		BaseChat: BaseChat{
+			ChatID: chatID,
+		},
+		InputMedia: files,
+	}
+}
+
+// NewInputMediaPhoto creates a new InputMediaPhoto.
+func NewInputMediaPhoto(media string) InputMediaPhoto {
+	return InputMediaPhoto{
+		Type:  "photo",
+		Media: media,
+	}
+}
+
+// NewInputMediaVideo creates a new InputMediaVideo.
+func NewInputMediaVideo(media string) InputMediaVideo {
+	return InputMediaVideo{
+		Type:  "video",
+		Media: media,
 	}
 }
 
@@ -403,12 +459,30 @@ func NewInlineQueryResultGIF(id, url string) InlineQueryResultGIF {
 	}
 }
 
+// NewInlineQueryResultCachedGIF create a new inline query with cached photo.
+func NewInlineQueryResultCachedGIF(id, gifID string) InlineQueryResultCachedGIF {
+	return InlineQueryResultCachedGIF{
+		Type:  "gif",
+		ID:    id,
+		GifID: gifID,
+	}
+}
+
 // NewInlineQueryResultMPEG4GIF creates a new inline query MPEG4 GIF.
 func NewInlineQueryResultMPEG4GIF(id, url string) InlineQueryResultMPEG4GIF {
 	return InlineQueryResultMPEG4GIF{
 		Type: "mpeg4_gif",
 		ID:   id,
 		URL:  url,
+	}
+}
+
+// NewInlineQueryResultCachedPhoto create a new inline query with cached photo.
+func NewInlineQueryResultCachedMPEG4GIF(id, MPEG4GifID string) InlineQueryResultCachedMpeg4Gif {
+	return InlineQueryResultCachedMpeg4Gif{
+		Type:   "mpeg4_gif",
+		ID:     id,
+		MGifID: MPEG4GifID,
 	}
 }
 
@@ -431,12 +505,31 @@ func NewInlineQueryResultPhotoWithThumb(id, url, thumb string) InlineQueryResult
 	}
 }
 
+// NewInlineQueryResultCachedPhoto create a new inline query with cached photo.
+func NewInlineQueryResultCachedPhoto(id, photoID string) InlineQueryResultCachedPhoto {
+	return InlineQueryResultCachedPhoto{
+		Type:    "photo",
+		ID:      id,
+		PhotoID: photoID,
+	}
+}
+
 // NewInlineQueryResultVideo creates a new inline query video.
 func NewInlineQueryResultVideo(id, url string) InlineQueryResultVideo {
 	return InlineQueryResultVideo{
 		Type: "video",
 		ID:   id,
 		URL:  url,
+	}
+}
+
+// NewInlineQueryResultCachedVideo create a new inline query with cached video.
+func NewInlineQueryResultCachedVideo(id, videoID, title string) InlineQueryResultCachedVideo {
+	return InlineQueryResultCachedVideo{
+		Type:    "video",
+		ID:      id,
+		VideoID: videoID,
+		Title:   title,
 	}
 }
 
@@ -450,6 +543,15 @@ func NewInlineQueryResultAudio(id, url, title string) InlineQueryResultAudio {
 	}
 }
 
+// NewInlineQueryResultCachedAudio create a new inline query with cached photo.
+func NewInlineQueryResultCachedAudio(id, audioID string) InlineQueryResultCachedAudio {
+	return InlineQueryResultCachedAudio{
+		Type:    "audio",
+		ID:      id,
+		AudioID: audioID,
+	}
+}
+
 // NewInlineQueryResultVoice creates a new inline query voice.
 func NewInlineQueryResultVoice(id, url, title string) InlineQueryResultVoice {
 	return InlineQueryResultVoice{
@@ -457,6 +559,16 @@ func NewInlineQueryResultVoice(id, url, title string) InlineQueryResultVoice {
 		ID:    id,
 		URL:   url,
 		Title: title,
+	}
+}
+
+// NewInlineQueryResultCachedVoice create a new inline query with cached photo.
+func NewInlineQueryResultCachedVoice(id, voiceID, title string) InlineQueryResultCachedVoice {
+	return InlineQueryResultCachedVoice{
+		Type:    "voice",
+		ID:      id,
+		VoiceID: voiceID,
+		Title:   title,
 	}
 }
 
@@ -468,6 +580,16 @@ func NewInlineQueryResultDocument(id, url, title, mimeType string) InlineQueryRe
 		URL:      url,
 		Title:    title,
 		MimeType: mimeType,
+	}
+}
+
+// NewInlineQueryResultCachedDocument create a new inline query with cached photo.
+func NewInlineQueryResultCachedDocument(id, documentID, title string) InlineQueryResultCachedDocument {
+	return InlineQueryResultCachedDocument{
+		Type:       "document",
+		ID:         id,
+		DocumentID: documentID,
+		Title:      title,
 	}
 }
 
@@ -500,7 +622,7 @@ func NewEditMessageCaption(chatID int64, messageID int, caption string) EditMess
 			ChatID:    chatID,
 			MessageID: messageID,
 		},
-		Caption: caption,
+		Caption:   caption,
 	}
 }
 

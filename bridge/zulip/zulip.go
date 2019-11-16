@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/42wim/matterbridge/bridge"
@@ -17,6 +19,7 @@ type Bzulip struct {
 	bot     *gzb.Bot
 	streams map[int]string
 	*bridge.Config
+	sync.RWMutex
 }
 
 func New(cfg *bridge.Config) bridge.Bridger {
@@ -100,14 +103,46 @@ func (b *Bzulip) getChannel(id int) string {
 
 func (b *Bzulip) handleQueue() error {
 	for {
-		messages, _ := b.q.GetEvents()
+		messages, err := b.q.GetEvents()
+		switch err {
+		case gzb.BackoffError:
+			time.Sleep(time.Second * 5)
+		case gzb.NoJSONError:
+			b.Log.Error("Response wasn't JSON, server down or restarting? sleeping 10 seconds")
+			time.Sleep(time.Second * 10)
+		case gzb.BadEventQueueError:
+			b.Log.Info("got a bad event queue id error, reconnecting")
+			b.bot.Queues = nil
+			for {
+				b.q, err = b.bot.RegisterAll()
+				if err != nil {
+					b.Log.Errorf("reconnecting failed: %s. Sleeping 10 seconds", err)
+					time.Sleep(time.Second * 10)
+				}
+				break
+			}
+		case gzb.HeartbeatError:
+			b.Log.Debug("heartbeat received.")
+		default:
+			b.Log.Debugf("receiving error: %#v", err)
+		}
+		if err != nil {
+			continue
+		}
 		for _, m := range messages {
 			b.Log.Debugf("== Receiving %#v", m)
 			// ignore our own messages
 			if m.SenderEmail == b.GetString("login") {
 				continue
 			}
-			rmsg := config.Message{Username: m.SenderFullName, Text: m.Content, Channel: b.getChannel(m.StreamID), Account: b.Account, UserID: strconv.Itoa(m.SenderID), Avatar: m.AvatarURL}
+			rmsg := config.Message{
+				Username: m.SenderFullName,
+				Text:     m.Content,
+				Channel:  b.getChannel(m.StreamID) + "/topic:" + m.Subject,
+				Account:  b.Account,
+				UserID:   strconv.Itoa(m.SenderID),
+				Avatar:   m.AvatarURL,
+			}
 			b.Log.Debugf("<= Sending message from %s on %s to gateway", rmsg.Username, b.Account)
 			b.Log.Debugf("<= Message is %#v", rmsg)
 			b.Remote <- rmsg
@@ -118,9 +153,11 @@ func (b *Bzulip) handleQueue() error {
 }
 
 func (b *Bzulip) sendMessage(msg config.Message) (string, error) {
-	topic := "matterbridge"
-	if b.GetString("topic") != "" {
-		topic = b.GetString("topic")
+	topic := ""
+	if strings.Contains(msg.Channel, "/topic:") {
+		res := strings.Split(msg.Channel, "/topic:")
+		topic = res[1]
+		msg.Channel = res[0]
 	}
 	m := gzb.Message{
 		Stream:  msg.Channel,

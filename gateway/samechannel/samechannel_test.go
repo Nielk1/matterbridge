@@ -1,10 +1,12 @@
-package samechannelgateway
+package samechannel
 
 import (
-	"github.com/42wim/matterbridge/bridge/config"
-	"github.com/stretchr/testify/assert"
-
+	"io/ioutil"
 	"testing"
+
+	"github.com/42wim/matterbridge/bridge/config"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 )
 
 const testConfig = `
@@ -66,7 +68,9 @@ var (
 )
 
 func TestGetConfig(t *testing.T) {
-	cfg := config.NewConfigFromString([]byte(testConfig))
+	logger := logrus.New()
+	logger.SetOutput(ioutil.Discard)
+	cfg := config.NewConfigFromString(logger, []byte(testConfig))
 	sgw := New(cfg)
 	configs := sgw.GetConfig()
 	assert.Equal(t, []config.Gateway{expectedConfig}, configs)

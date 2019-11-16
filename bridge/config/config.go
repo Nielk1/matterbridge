@@ -8,22 +8,22 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	prefixed "github.com/matterbridge/logrus-prefixed-formatter"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
 const (
-	EventJoinLeave       = "join_leave"
-	EventTopicChange     = "topic_change"
-	EventFailure         = "failure"
-	EventFileFailureSize = "file_failure_size"
-	EventAvatarDownload  = "avatar_download"
-	EventRejoinChannels  = "rejoin_channels"
-	EventUserAction      = "user_action"
-	EventMsgDelete       = "msg_delete"
-	EventAPIConnected    = "api_connected"
-	EventUserTyping      = "user_typing"
+	EventJoinLeave         = "join_leave"
+	EventTopicChange       = "topic_change"
+	EventFailure           = "failure"
+	EventFileFailureSize   = "file_failure_size"
+	EventAvatarDownload    = "avatar_download"
+	EventRejoinChannels    = "rejoin_channels"
+	EventUserAction        = "user_action"
+	EventMsgDelete         = "msg_delete"
+	EventAPIConnected      = "api_connected"
+	EventUserTyping        = "user_typing"
+	EventGetChannelMembers = "get_channel_members"
 )
 
 type Message struct {
@@ -61,6 +61,16 @@ type ChannelInfo struct {
 	Options     ChannelOptions
 }
 
+type ChannelMember struct {
+	Username    string
+	Nick        string
+	UserID      string
+	ChannelID   string
+	ChannelName string
+}
+
+type ChannelMembers []ChannelMember
+
 type Protocol struct {
 	AuthCode               string // steam
 	BindAddress            string // mattermost, slack // DEPRECATED
@@ -72,6 +82,7 @@ type Protocol struct {
 	EditSuffix             string // mattermost, slack, discord, telegram, gitter
 	EditDisable            bool   // mattermost, slack, discord, telegram, gitter
 	IconURL                string // mattermost, slack
+	IgnoreFailureOnStart   bool   // general
 	IgnoreNicks            string // all protocols
 	IgnoreMessages         string // all protocols
 	Jid                    string // xmpp
@@ -82,6 +93,7 @@ type Protocol struct {
 	MediaDownloadSize      int    // all protocols
 	MediaServerDownload    string
 	MediaServerUpload      string
+	MediaConvertWebPToPNG  bool       // telegram
 	MessageDelay           int        // IRC, time in millisecond to wait between messages
 	MessageFormat          string     // telegram
 	MessageLength          int        // IRC, max length of a message allowed
@@ -108,31 +120,37 @@ type Protocol struct {
 	ReplaceMessages        [][]string // all protocols
 	ReplaceNicks           [][]string // all protocols
 	RemoteNickFormat       string     // all protocols
+	RunCommands            []string   // IRC
 	Server                 string     // IRC,mattermost,XMPP,discord
 	ShowJoinPart           bool       // all protocols
 	ShowTopicChange        bool       // slack
 	ShowUserTyping         bool       // slack
 	ShowEmbeds             bool       // discord
 	SkipTLSVerify          bool       // IRC, mattermost
+	SkipVersionCheck       bool       // mattermost
 	StripNick              bool       // all protocols
-	Team                   string     // mattermost
+	SyncTopic              bool       // slack
+	TengoModifyMessage     string     // general
+	Team                   string     // mattermost, keybase
 	Token                  string     // gitter, slack, discord, api
 	Topic                  string     // zulip
 	URL                    string     // mattermost, slack // DEPRECATED
 	UseAPI                 bool       // mattermost, slack
 	UseSASL                bool       // IRC
 	UseTLS                 bool       // IRC
+	UseDiscriminator       bool       // discord
 	UseFirstName           bool       // telegram
 	UseUserName            bool       // discord
 	UseInsecureURL         bool       // telegram
+	VerboseJoinPart        bool       // IRC
 	WebhookBindAddress     string     // mattermost, slack
 	WebhookURL             string     // mattermost, slack
-	WebhookUse             string     // mattermost, slack, discord
 }
 
 type ChannelOptions struct {
 	Key        string // irc, xmpp
 	WebhookURL string // discord
+	Topic      string // zulip
 }
 
 type Bridge struct {
@@ -148,6 +166,13 @@ type Gateway struct {
 	In     []Bridge
 	Out    []Bridge
 	InOut  []Bridge
+}
+
+type Tengo struct {
+	InMessage        string
+	Message          string
+	RemoteNickFormat string
+	OutMessage       string
 }
 
 type SameChannelGateway struct {
@@ -171,13 +196,17 @@ type BridgeValues struct {
 	Telegram           map[string]Protocol
 	Rocketchat         map[string]Protocol
 	SSHChat            map[string]Protocol
+	WhatsApp           map[string]Protocol // TODO is this struct used? Search for "SlackLegacy" for example didn't return any results
 	Zulip              map[string]Protocol
+	Keybase            map[string]Protocol
 	General            Protocol
+	Tengo              Tengo
 	Gateway            []Gateway
 	SameChannelGateway []SameChannelGateway
 }
 
 type Config interface {
+	Viper() *viper.Viper
 	BridgeValues() *BridgeValues
 	GetBool(key string) (bool, bool)
 	GetInt(key string) (int, bool)
@@ -187,63 +216,58 @@ type Config interface {
 }
 
 type config struct {
-	v *viper.Viper
 	sync.RWMutex
 
-	cv *BridgeValues
+	logger *logrus.Entry
+	v      *viper.Viper
+	cv     *BridgeValues
 }
 
-func NewConfig(cfgfile string) Config {
-	log.SetFormatter(&prefixed.TextFormatter{PrefixPadding: 13, DisableColors: true, FullTimestamp: false})
-	flog := log.WithFields(log.Fields{"prefix": "config"})
+// NewConfig instantiates a new configuration based on the specified configuration file path.
+func NewConfig(rootLogger *logrus.Logger, cfgfile string) Config {
+	logger := rootLogger.WithFields(logrus.Fields{"prefix": "config"})
+
 	viper.SetConfigFile(cfgfile)
-	input, err := getFileContents(cfgfile)
+	input, err := ioutil.ReadFile(cfgfile)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatalf("Failed to read configuration file: %#v", err)
 	}
-	mycfg := newConfigFromString(input)
+
+	mycfg := newConfigFromString(logger, input)
 	if mycfg.cv.General.MediaDownloadSize == 0 {
 		mycfg.cv.General.MediaDownloadSize = 1000000
 	}
 	viper.WatchConfig()
 	viper.OnConfigChange(func(e fsnotify.Event) {
-		flog.Println("Config file changed:", e.Name)
+		logger.Println("Config file changed:", e.Name)
 	})
 	return mycfg
 }
 
-func getFileContents(filename string) ([]byte, error) {
-	input, err := ioutil.ReadFile(filename)
-	if err != nil {
-		log.Fatal(err)
-		return []byte(nil), err
-	}
-	return input, nil
+// NewConfigFromString instantiates a new configuration based on the specified string.
+func NewConfigFromString(rootLogger *logrus.Logger, input []byte) Config {
+	logger := rootLogger.WithFields(logrus.Fields{"prefix": "config"})
+	return newConfigFromString(logger, input)
 }
 
-func NewConfigFromString(input []byte) Config {
-	return newConfigFromString(input)
-}
-
-func newConfigFromString(input []byte) *config {
+func newConfigFromString(logger *logrus.Entry, input []byte) *config {
 	viper.SetConfigType("toml")
 	viper.SetEnvPrefix("matterbridge")
-	viper.AddConfigPath(".")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	viper.AutomaticEnv()
-	err := viper.ReadConfig(bytes.NewBuffer(input))
-	if err != nil {
-		log.Fatal(err)
+
+	if err := viper.ReadConfig(bytes.NewBuffer(input)); err != nil {
+		logger.Fatalf("Failed to parse the configuration: %s", err)
 	}
 
 	cfg := &BridgeValues{}
-	err = viper.Unmarshal(cfg)
-	if err != nil {
-		log.Fatal(err)
+	if err := viper.Unmarshal(cfg); err != nil {
+		logger.Fatalf("Failed to load the configuration: %s", err)
 	}
 	return &config{
-		v:  viper.GetViper(),
-		cv: cfg,
+		logger: logger,
+		v:      viper.GetViper(),
+		cv:     cfg,
 	}
 }
 
@@ -251,49 +275,51 @@ func (c *config) BridgeValues() *BridgeValues {
 	return c.cv
 }
 
+func (c *config) Viper() *viper.Viper {
+	return c.v
+}
+
 func (c *config) GetBool(key string) (bool, bool) {
 	c.RLock()
 	defer c.RUnlock()
-	//	log.Debugf("getting bool %s = %#v", key, c.v.GetBool(key))
 	return c.v.GetBool(key), c.v.IsSet(key)
 }
 
 func (c *config) GetInt(key string) (int, bool) {
 	c.RLock()
 	defer c.RUnlock()
-	//	log.Debugf("getting int %s = %d", key, c.v.GetInt(key))
 	return c.v.GetInt(key), c.v.IsSet(key)
 }
 
 func (c *config) GetString(key string) (string, bool) {
 	c.RLock()
 	defer c.RUnlock()
-	//	log.Debugf("getting String %s = %s", key, c.v.GetString(key))
 	return c.v.GetString(key), c.v.IsSet(key)
 }
 
 func (c *config) GetStringSlice(key string) ([]string, bool) {
 	c.RLock()
 	defer c.RUnlock()
-	// log.Debugf("getting StringSlice %s = %#v", key, c.v.GetStringSlice(key))
 	return c.v.GetStringSlice(key), c.v.IsSet(key)
 }
 
 func (c *config) GetStringSlice2D(key string) ([][]string, bool) {
 	c.RLock()
 	defer c.RUnlock()
-	result := [][]string{}
-	if res, ok := c.v.Get(key).([]interface{}); ok {
-		for _, entry := range res {
-			result2 := []string{}
-			for _, entry2 := range entry.([]interface{}) {
-				result2 = append(result2, entry2.(string))
-			}
-			result = append(result, result2)
-		}
-		return result, true
+
+	res, ok := c.v.Get(key).([]interface{})
+	if !ok {
+		return nil, false
 	}
-	return result, false
+	var result [][]string
+	for _, entry := range res {
+		result2 := []string{}
+		for _, entry2 := range entry.([]interface{}) {
+			result2 = append(result2, entry2.(string))
+		}
+		result = append(result, result2)
+	}
+	return result, true
 }
 
 func GetIconURL(msg *Message, iconURL string) string {

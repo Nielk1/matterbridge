@@ -113,7 +113,7 @@ func Fmt(text string) string {
 
 		if last > -1 {
 			// A-Z, a-z, and ","
-			if text[i] != ',' && (text[i] <= 'A' || text[i] >= 'Z') && (text[i] <= 'a' || text[i] >= 'z') {
+			if text[i] != ',' && (text[i] < 'A' || text[i] > 'Z') && (text[i] < 'a' || text[i] > 'z') {
 				last = -1
 				continue
 			}
@@ -211,7 +211,7 @@ func IsValidChannel(channel string) bool {
 	return true
 }
 
-// IsValidNick validates an IRC nickame. Note that this does not validate
+// IsValidNick validates an IRC nickname. Note that this does not validate
 // IRC nickname length.
 //
 //   nickname =  ( letter / special ) *8( letter / digit / special / "-" )

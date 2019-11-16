@@ -22,19 +22,20 @@ func (b *Bslack) handleSlack() {
 	time.Sleep(time.Second)
 	b.Log.Debug("Start listening for Slack messages")
 	for message := range messages {
-		if message.Event != config.EventUserTyping {
+		// don't do any action on deleted/typing messages
+		if message.Event != config.EventUserTyping && message.Event != config.EventMsgDelete {
 			b.Log.Debugf("<= Sending message from %s on %s to gateway", message.Username, b.Account)
+			// cleanup the message
+			message.Text = b.replaceMention(message.Text)
+			message.Text = b.replaceVariable(message.Text)
+			message.Text = b.replaceChannel(message.Text)
+			message.Text = b.replaceURL(message.Text)
+			message.Text = b.replaceb0rkedMarkDown(message.Text)
+			message.Text = html.UnescapeString(message.Text)
+
+			// Add the avatar
+			message.Avatar = b.users.getAvatar(message.UserID)
 		}
-
-		// cleanup the message
-		message.Text = b.replaceMention(message.Text)
-		message.Text = b.replaceVariable(message.Text)
-		message.Text = b.replaceChannel(message.Text)
-		message.Text = b.replaceURL(message.Text)
-		message.Text = html.UnescapeString(message.Text)
-
-		// Add the avatar
-		message.Avatar = b.getAvatar(message.UserID)
 
 		b.Log.Debugf("<= Message is %#v", message)
 		b.Remote <- *message
@@ -43,7 +44,7 @@ func (b *Bslack) handleSlack() {
 
 func (b *Bslack) handleSlackClient(messages chan *config.Message) {
 	for msg := range b.rtm.IncomingEvents {
-		if msg.Type != sUserTyping && msg.Type != sLatencyReport {
+		if msg.Type != sUserTyping && msg.Type != sHello && msg.Type != sLatencyReport {
 			b.Log.Debugf("== Receiving event %#v", msg.Data)
 		}
 		switch ev := msg.Data.(type) {
@@ -75,21 +76,21 @@ func (b *Bslack) handleSlackClient(messages chan *config.Message) {
 			// When we join a channel we update the full list of users as
 			// well as the information for the channel that we joined as this
 			// should now tell that we are a member of it.
-			b.populateUsers()
-
-			b.channelsMutex.Lock()
-			b.channelsByID[ev.Channel.ID] = &ev.Channel
-			b.channelsByName[ev.Channel.Name] = &ev.Channel
-			b.channelsMutex.Unlock()
+			b.channels.registerChannel(ev.Channel)
 		case *slack.ConnectedEvent:
 			b.si = ev.Info
-			b.populateChannels()
-			b.populateUsers()
+			b.channels.populateChannels(true)
+			b.users.populateUsers(true)
 		case *slack.InvalidAuthEvent:
 			b.Log.Fatalf("Invalid Token %#v", ev)
 		case *slack.ConnectionErrorEvent:
 			b.Log.Errorf("Connection failed %#v %#v", ev.Error(), ev.ErrorObj)
+		case *slack.MemberJoinedChannelEvent:
+			b.users.populateUser(ev.User)
+		case *slack.HelloEvent, *slack.LatencyReport:
+			continue
 		default:
+			b.Log.Debugf("Unhandled incoming event: %T", ev)
 		}
 	}
 }
@@ -116,6 +117,11 @@ func (b *Bslack) skipMessageEvent(ev *slack.MessageEvent) bool {
 		return b.GetBool(noSendJoinConfig)
 	case sPinnedItem, sUnpinnedItem:
 		return true
+	case sChannelTopic, sChannelPurpose:
+		// Skip the event if our bot/user account changed the topic/purpose
+		if ev.User == b.si.User.ID {
+			return true
+		}
 	}
 
 	// Skip any messages that we made ourselves or from 'slackbot' (see #527).
@@ -125,18 +131,23 @@ func (b *Bslack) skipMessageEvent(ev *slack.MessageEvent) bool {
 		return true
 	}
 
-	// It seems ev.SubMessage.Edited == nil when slack unfurls.
-	// Do not forward these messages. See Github issue #266.
-	if ev.SubMessage != nil &&
-		ev.SubMessage.ThreadTimestamp != ev.SubMessage.Timestamp &&
-		ev.SubMessage.Edited == nil {
-		return true
+	if ev.SubMessage != nil {
+		// It seems ev.SubMessage.Edited == nil when slack unfurls.
+		// Do not forward these messages. See Github issue #266.
+		if ev.SubMessage.ThreadTimestamp != ev.SubMessage.Timestamp &&
+			ev.SubMessage.Edited == nil {
+			return true
+		}
+		// see hidden subtypes at https://api.slack.com/events/message
+		// these messages are sent when we add a message to a thread #709
+		if ev.SubType == "message_replied" && ev.Hidden {
+			return true
+		}
 	}
 
 	if len(ev.Files) > 0 {
 		return b.filesCached(ev.Files)
 	}
-
 	return false
 }
 
@@ -185,6 +196,9 @@ func (b *Bslack) handleMessageEvent(ev *slack.MessageEvent) (*config.Message, er
 			// This is probably a webhook we couldn't resolve.
 			return nil, fmt.Errorf("message handling resulted in an empty bot message (probably an incoming webhook we couldn't resolve): %#v", ev)
 		}
+		if ev.SubMessage != nil {
+			return nil, fmt.Errorf("message handling resulted in an empty message: %#v with submessage %#v", ev, ev.SubMessage)
+		}
 		return nil, fmt.Errorf("message handling resulted in an empty message: %#v", ev)
 	}
 	return rmsg, nil
@@ -193,7 +207,6 @@ func (b *Bslack) handleMessageEvent(ev *slack.MessageEvent) (*config.Message, er
 func (b *Bslack) handleStatusEvent(ev *slack.MessageEvent, rmsg *config.Message) bool {
 	switch ev.SubType {
 	case sChannelJoined, sMemberJoined:
-		b.populateUsers()
 		// There's no further processing needed on channel events
 		// so we return 'true'.
 		return true
@@ -201,7 +214,15 @@ func (b *Bslack) handleStatusEvent(ev *slack.MessageEvent, rmsg *config.Message)
 		rmsg.Username = sSystemUser
 		rmsg.Event = config.EventJoinLeave
 	case sChannelTopic, sChannelPurpose:
+		b.channels.populateChannels(false)
 		rmsg.Event = config.EventTopicChange
+	case sMessageChanged:
+		rmsg.Text = ev.SubMessage.Text
+		// handle deleted thread starting messages
+		if ev.SubMessage.Text == "This message was deleted." {
+			rmsg.Event = config.EventMsgDelete
+			return true
+		}
 	case sMessageDeleted:
 		rmsg.Text = config.EventMsgDelete
 		rmsg.Event = config.EventMsgDelete
@@ -242,14 +263,14 @@ func (b *Bslack) handleAttachments(ev *slack.MessageEvent, rmsg *config.Message)
 
 	// If we have files attached, download them (in memory) and put a pointer to it in msg.Extra.
 	for i := range ev.Files {
-		if err := b.handleDownloadFile(rmsg, &ev.Files[i]); err != nil {
+		if err := b.handleDownloadFile(rmsg, &ev.Files[i], false); err != nil {
 			b.Log.Errorf("Could not download incoming file: %#v", err)
 		}
 	}
 }
 
 func (b *Bslack) handleTypingEvent(ev *slack.UserTypingEvent) (*config.Message, error) {
-	channelInfo, err := b.getChannelByID(ev.Channel)
+	channelInfo, err := b.channels.getChannelByID(ev.Channel)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +282,7 @@ func (b *Bslack) handleTypingEvent(ev *slack.UserTypingEvent) (*config.Message, 
 }
 
 // handleDownloadFile handles file download
-func (b *Bslack) handleDownloadFile(rmsg *config.Message, file *slack.File) error {
+func (b *Bslack) handleDownloadFile(rmsg *config.Message, file *slack.File, retry bool) error {
 	if b.fileCached(file) {
 		return nil
 	}
@@ -277,6 +298,12 @@ func (b *Bslack) handleDownloadFile(rmsg *config.Message, file *slack.File) erro
 		return fmt.Errorf("download %s failed %#v", file.URLPrivateDownload, err)
 	}
 
+	if len(*data) != file.Size && !retry {
+		b.Log.Debugf("Data size (%d) is not equal to size declared (%d)\n", len(*data), file.Size)
+		time.Sleep(1 * time.Second)
+		return b.handleDownloadFile(rmsg, file, true)
+	}
+
 	// If a comment is attached to the file(s) it is in the 'Text' field of the Slack messge event
 	// and should be added as comment to only one of the files. We reset the 'Text' field to ensure
 	// that the comment is not duplicated.
@@ -284,6 +311,29 @@ func (b *Bslack) handleDownloadFile(rmsg *config.Message, file *slack.File) erro
 	rmsg.Text = ""
 	helper.HandleDownloadData(b.Log, rmsg, file.Name, comment, file.URLPrivateDownload, data, b.General)
 	return nil
+}
+
+// handleGetChannelMembers handles messages containing the GetChannelMembers event
+// Sends a message to the router containing *config.ChannelMembers
+func (b *Bslack) handleGetChannelMembers(rmsg *config.Message) bool {
+	if rmsg.Event != config.EventGetChannelMembers {
+		return false
+	}
+
+	cMembers := b.channels.getChannelMembers(b.users)
+
+	extra := make(map[string][]interface{})
+	extra[config.EventGetChannelMembers] = append(extra[config.EventGetChannelMembers], cMembers)
+	msg := config.Message{
+		Extra:   extra,
+		Event:   config.EventGetChannelMembers,
+		Account: b.Account,
+	}
+
+	b.Log.Debugf("sending msg to remote %#v", msg)
+	b.Remote <- msg
+
+	return true
 }
 
 // fileCached implements Matterbridge's caching logic for files

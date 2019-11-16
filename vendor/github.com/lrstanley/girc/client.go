@@ -12,8 +12,11 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
+	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +84,10 @@ type Config struct {
 	// supported. Capability tracking must be enabled for this to work, as
 	// this requires IRCv3 CAP handling.
 	SASL SASLMech
+	// WebIRC allows forwarding source user hostname/ip information to the server
+	// (if supported by the server) to ensure the source machine doesn't show as
+	// the source. See the WebIRC type for more information.
+	WebIRC WebIRC
 	// Bind is used to bind to a specific host or ip during the dial process
 	// when connecting to the server. This can be a hostname, however it must
 	// resolve to an IPv4/IPv6 address bindable on your system. Otherwise,
@@ -91,6 +98,16 @@ type Config struct {
 	// configuration (e.g. to not force hostname checking). This only has an
 	// affect during the dial process.
 	SSL bool
+	// DisableSTS disables the use of automatic STS connection upgrades
+	// when the server supports STS. STS can also be disabled using the environment
+	// variable "GIRC_DISABLE_STS=true". As many clients may not propagate options
+	// like this back to the user, this allows to directly disable such automatic
+	// functionality.
+	DisableSTS bool
+	// DisableSTSFallback disables the "fallback" to a non-tls connection if the
+	// strict transport policy expires and the first attempt to reconnect back to
+	// the tls version fails.
+	DisableSTSFallback bool
 	// TLSConfig is an optional user-supplied tls configuration, used during
 	// socket creation to the server. SSL must be enabled for this to be used.
 	// This only has an affect during the dial process.
@@ -142,7 +159,7 @@ type Config struct {
 
 	// disableTracking disables all channel and user-level tracking. Useful
 	// for highly embedded scripts with single purposes. This has an exported
-	// method which enables this and ensures prop cleanup, see
+	// method which enables this and ensures proper cleanup, see
 	// Client.DisableTracking().
 	disableTracking bool
 	// HandleNickCollide when set, allows the client to handle nick collisions
@@ -152,6 +169,39 @@ type Config struct {
 	// blocked by the network/a service, the client will try and use "test_",
 	// then it will attempt "test__", "test___", and so on.
 	HandleNickCollide func(oldNick string) (newNick string)
+}
+
+// WebIRC is useful when a user connects through an indirect method, such web
+// clients, the indirect client sends its own IP address instead of sending the
+// user's IP address unless WebIRC is implemented by both the client and the
+// server.
+//
+// Client expectations:
+//  - Perform any proxy resolution.
+//  - Check the reverse DNS and forward DNS match.
+//  - Check the IP against suitable access controls (ipaccess, dnsbl, etc).
+//
+// More information:
+//  - https://ircv3.net/specs/extensions/webirc.html
+//  - https://kiwiirc.com/docs/webirc
+type WebIRC struct {
+	// Password that authenticates the WEBIRC command from this client.
+	Password string
+	// Gateway or client type requesting spoof (cgiirc defaults to cgiirc, as an
+	// example).
+	Gateway string
+	// Hostname of user.
+	Hostname string
+	// Address either in IPv4 dotted quad notation (e.g. 192.0.0.2) or IPv6
+	// notation (e.g. 1234:5678:9abc::def). IPv4-in-IPv6 addresses
+	// (e.g. ::ffff:192.0.0.2) should not be sent.
+	Address string
+}
+
+// Params returns the arguments for the WEBIRC command that can be passed to the
+// server.
+func (w WebIRC) Params() []string {
+	return []string{w.Password, w.Gateway, w.Hostname, w.Address}
 }
 
 // ErrInvalidConfig is returned when the configuration passed to the client
@@ -210,11 +260,26 @@ func New(config Config) *Client {
 		c.Config.PingDelay = 600 * time.Second
 	}
 
+	envDebug, _ := strconv.ParseBool(os.Getenv("GIRC_DEBUG"))
 	if c.Config.Debug == nil {
-		c.debug = log.New(ioutil.Discard, "", 0)
+		if envDebug {
+			c.debug = log.New(os.Stderr, "debug:", log.Ltime|log.Lshortfile)
+		} else {
+			c.debug = log.New(ioutil.Discard, "", 0)
+		}
 	} else {
+		if envDebug {
+			if c.Config.Debug != os.Stdout && c.Config.Debug != os.Stderr {
+				c.Config.Debug = io.MultiWriter(os.Stderr, c.Config.Debug)
+			}
+		}
 		c.debug = log.New(c.Config.Debug, "debug:", log.Ltime|log.Lshortfile)
 		c.debug.Print("initializing debugging")
+	}
+
+	envDisableSTS, _ := strconv.ParseBool((os.Getenv("GIRC_DISABLE_STS")))
+	if envDisableSTS {
+		c.Config.DisableSTS = envDisableSTS
 	}
 
 	// Setup the caller.
@@ -222,7 +287,7 @@ func New(config Config) *Client {
 
 	// Give ourselves a new state.
 	c.state = &state{}
-	c.state.reset()
+	c.state.reset(true)
 
 	// Register builtin handlers.
 	c.registerBuiltins()
@@ -273,7 +338,7 @@ func (c *Client) TLSConnectionState() (*tls.ConnectionState, error) {
 // the connection to the server wasn't made with TLS.
 var ErrConnNotTLS = errors.New("underlying connection is not tls")
 
-// Close closes the network connection to the server, and sends a STOPPED
+// Close closes the network connection to the server, and sends a CLOSED
 // event. This should cause Connect() to return with nil. This should be
 // safe to call multiple times. See Connect()'s documentation on how
 // handlers and goroutines are handled when disconnected from the server.
@@ -284,6 +349,18 @@ func (c *Client) Close() {
 		c.stop()
 	}
 	c.mu.RUnlock()
+}
+
+// Quit sends a QUIT message to the server with a given reason to close the
+// connection. Underlying this event being sent, Client.Close() is called as well.
+// This is different than just calling Client.Close() in that it provides a reason
+// as to why the connection was closed (for bots to tell users the bot is restarting,
+// or shutting down, etc).
+//
+// NOTE: servers may delay showing of QUIT reasons, until you've been connected to
+// the server for a certain period of time (e.g. 5 minutes). Keep this in mind.
+func (c *Client) Quit(reason string) {
+	c.Send(&Event{Command: QUIT, Params: []string{reason}})
 }
 
 // ErrEvent is an error returned when the server (or library) sends an ERROR
@@ -298,7 +375,7 @@ func (e *ErrEvent) Error() string {
 		return "unknown error occurred"
 	}
 
-	return e.Event.Trailing
+	return e.Event.Last()
 }
 
 func (c *Client) execLoop(ctx context.Context, errs chan error, wg *sync.WaitGroup) {
@@ -363,9 +440,21 @@ func (c *Client) DisableTracking() {
 	c.registerBuiltins()
 }
 
-// Server returns the string representation of host+port pair for net.Conn.
+// Server returns the string representation of host+port pair for the connection.
 func (c *Client) Server() string {
-	return fmt.Sprintf("%s:%d", c.Config.Server, c.Config.Port)
+	c.state.Lock()
+	defer c.state.Lock()
+
+	return c.server()
+}
+
+// server returns the string representation of host+port pair for net.Conn, and
+// takes into consideration STS. Must lock state mu first!
+func (c *Client) server() string {
+	if c.state.sts.enabled() {
+		return net.JoinHostPort(c.Config.Server, strconv.Itoa(c.state.sts.upgradePort))
+	}
+	return net.JoinHostPort(c.Config.Server, strconv.Itoa(c.Config.Port))
 }
 
 // Lifetime returns the amount of time that has passed since the client was
@@ -434,6 +523,12 @@ func (c *Client) GetNick() string {
 		return c.Config.Nick
 	}
 	return c.state.nick
+}
+
+// GetID returns an RFC1459 compliant version of the current nickname. Panics
+// if tracking is disabled.
+func (c *Client) GetID() string {
+	return ToRFC1459(c.GetNick())
 }
 
 // GetIdent returns the current ident of the active connection. Panics if
@@ -645,8 +740,9 @@ func (c *Client) HasCapability(name string) (has bool) {
 	name = strings.ToLower(name)
 
 	c.state.RLock()
-	for i := 0; i < len(c.state.enabledCap); i++ {
-		if strings.ToLower(c.state.enabledCap[i]) == name {
+	for key := range c.state.enabledCap {
+		key = strings.ToLower(key)
+		if key == name {
 			has = true
 			break
 		}
@@ -669,4 +765,26 @@ func (c *Client) panicIfNotTracking() {
 	_, file, line, _ := runtime.Caller(2)
 
 	panic(fmt.Sprintf("%s used when tracking is disabled (caller %s:%d)", fn.Name(), file, line))
+}
+
+func (c *Client) debugLogEvent(e *Event, dropped bool) {
+	var prefix string
+
+	if dropped {
+		prefix = "dropping event (disconnected):"
+	} else {
+		prefix = ">"
+	}
+
+	if e.Sensitive {
+		c.debug.Printf(prefix, " %s ***redacted***", e.Command)
+	} else {
+		c.debug.Print(prefix, " ", StripRaw(e.String()))
+	}
+
+	if c.Config.Out != nil {
+		if pretty, ok := e.Pretty(); ok {
+			fmt.Fprintln(c.Config.Out, StripRaw(pretty))
+		}
+	}
 }

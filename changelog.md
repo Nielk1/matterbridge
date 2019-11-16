@@ -1,3 +1,233 @@
+# dev
+
+# v1.16.1
+
+## New features
+
+* rocketchat: add token support #892
+* matrix: Add support for uploading application/x and audio/x (matrix). #929
+
+## Enhancements
+
+* general: Do configuration validation on start-up. Fixes #888
+* general: updated vendored libraries (discord/whatsapp) #932
+* discord: user typing messages #914
+* slack: Convert slack bold/strike to correct markdown (slack). Fixes #918
+
+## Bugfix
+
+* discord: fix Failed to fetch information for members message. #894
+* discord: remove obsolete file upload links (discord). #931
+* slack: suppress unhandled HelloEvent message #913
+* mattermost: Fix panic on WebhookURL only setting (mattermost). #917
+* matrix: fix corrupted links between slack and matrix #924
+
+This release couldn't exist without the following contributors:
+@qaisjp, @hramrach, @42wim
+
+# v1.16.0
+
+## New features
+
+* keybase: new protocol added. Add initial Keybase Chat support #877 Thanks to @hyperobject
+* discord: Support webhook files in discord #872
+
+## Enhancements
+
+* general: update dependencies
+
+## Bugfix
+
+* discord: Underscores from Discord don't arrive correctly #864
+* xmpp: Fix possible panic at startup of the XMPP bridge #869
+* mattermost: Make getChannelIdTeam behave like GetChannelId for groups (mattermost) #873
+
+This release couldn't exist without the following contributors:
+@hyperobject, @42wim, @bucko909, @MOZGIII
+
+# v1.15.1
+
+## New features
+* discord: Support webhook message deletions (discord) (#853)
+
+## Enhancements
+
+* discord: Support bulk deletions #851
+* discord: Support channels in categories #863 (use category/channel. See matterbridge.toml.sample for more info)
+* mattermost: Add an option to skip the Mattermost server version check #849
+
+## Bugfix
+
+* xmpp: fix segfault when disconnected/reconnected #856
+* telegram: fix panic in handleEntities #858
+
+This release couldn't exist without the following contributors:
+@42wim, @qaisjp, @joohoi
+
+# v1.15.0
+## New features
+* Add scripting (tengo) support for every outgoing message (#806)
+  See https://github.com/42wim/matterbridge/wiki/Settings#tengo and 
+  https://github.com/42wim/matterbridge/wiki/Settings#outmessage for more information
+* Add tengo support to RemoteNickFormat (#793)
+  See https://github.com/42wim/matterbridge/wiki/Settings#remotenickformat-2
+  * Deprecated `Message` under `[tengo]` to `InMessage`
+
+## Enhancements
+  * general: Forward only user-typing messages if supported by protocol (#832)
+  * general: updated wiki with all possible settings: https://github.com/42wim/matterbridge/wiki/Settings
+  * tengo: Add msg event to tengo
+  * xmpp: Verify TLS against JID domain, not the host. (xmpp) (#834)
+  * xmpp: Allow messages with timestamp (xmpp). Fixes #835 (#847)
+  * irc: Add verbose IRC joins/parts (ident@host) (#805)
+  See https://github.com/42wim/matterbridge/wiki/Settings#verbosejoinpart
+  * rocketchat: Add useraction support (rocketchat). Closes #772 (#794)
+
+## Bugfix
+  * slack: Fix regression in autojoining with legacy tokens (slack). Fixes #651 (#848)
+  * xmpp: Revert xmpp to orig behaviour. Closes #844
+* whatsapp: Update github.com/Rhymen/go-whatsapp vendor. Fixes #843
+* mattermost: Update channels of all teams (mattermost)
+
+This release couldn't exist without the following contributors:
+@42wim, @Helcaraxan, @chotaire, @qaisjp, @dajohi, @kousu
+
+# v1.14.4
+
+## Bugfix
+* mattermost: Add Id to EditMessage (mattermost). Fixes #802
+* mattermost: Fix panic on nil message.Post (mattermost). Fixes #804
+* mattermost: Handle unthreaded messages (mattermost). Fixes #803
+* mattermost: Use paging in initUser and UpdateUsers (mattermost)
+* slack: Add lacking clean-up in Slack synchronisation (#811)
+* slack: Disable user lookups on delete messages (slack) (#812)
+
+# v1.14.3
+
+## Bugfix
+* irc: Fix deadlock on reconnect (irc). Closes #757
+
+# v1.14.2
+
+## Bugfix
+* general: Update tengo vendor and load the stdlib. Fixes #789 (#792)
+* rocketchat: Look up #channel too (rocketchat). Fix #773 (#775)
+* slack: Ignore messagereplied and hidden messages (slack). Fixes #709 (#779)
+* telegram: Handle nil message (telegram). Fixes #777
+* irc: Use default nick if none specified (irc). Fixes #785
+* irc: Return when not connected and drop a message (irc). Fixes #786
+* irc: Revert fix for #722 (Support quits from irc correctly). Closes #781
+
+## Contributors
+This release couldn't exist without the following contributors:
+@42wim, @Helcaraxan, @dajohi
+
+# v1.14.1
+## Bugfix
+* slack: Fix crash double unlock (slack) (#771)
+
+# v1.14.0
+
+## Breaking
+* zulip: Need to specify /topic:mytopic for channel configuration (zulip). (#751)
+
+## New features
+* whatsapp: new protocol added. Add initial WhatsApp support (#711) Thanks to @KrzysztofMadejski
+* facebook messenger: new protocol via matterbridge api. See https://github.com/VictorNine/fbridge/ for more information.
+* general: Add scripting (tengo) support for every incoming message (#731). See `TengoModifyMessage`
+* general: Allow regexs in ignoreNicks. Closes #690 (#720)
+* general: Support rewriting messages from relaybots using ExtractNicks. Fixes #466 (#730). See `ExtractNicks` in matterbridge.toml.sample
+* general: refactor Make all loggers derive from non-default instance (#728). Thanks to @Helcaraxan
+* rocketchat: add support for the rocketchat API. Sending to rocketchat now supports uploading of files, editing and deleting of messages.
+* discord: Support join/leaves from discord. Closes #654 (#721)
+* discord: Allow sending discriminator with Discord username (#726). See `UseDiscriminator` in matterbridge.toml.sample
+* slack: Add extra debug option (slack). See `Debug` in the slack section in matterbridge.toml.sample
+* telegram: Add support for URL in messageEntities (telegram). Fixes #735 (#736)
+* telegram: Add MediaConvertWebPToPNG option (telegram). (#741). See `MediaConvertWebPToPNG` in matterbridge.toml.sample
+
+## Enhancements
+* general: Fail gracefully on incorrect human input. Fixes #739 (#740)
+* matrix: Detect html nicks in RemoteNickFormat (matrix). Fixes #696 (#719)
+* matrix: Send notices on join/parts (matrix). Fixes #712 (#716)
+
+## Bugfix
+* general: Handle file upload/download only once for each message (#742)
+* zulip: Fix error handling on bad event queue id (zulip). Closes #694
+* zulip: Keep reconnecting until succeed (zulip) (#737)
+* irc: add support for (older) unrealircd versions. #708
+* irc: Support quits from irc correctly. Fixes #722 (#724)
+* matrix: Send username when uploading video/images (matrix). Fixes #715 (#717)
+* matrix: Trim <p> and </p> tags (matrix). Closes #686 (#753)
+* slack: Hint at thread replies when messages are unthreaded (slack) (#684)
+* slack: Fix race-condition in populateUser() (#767)
+* xmpp: Do not send topic changes on connect (xmpp). Fixes #732 (#733)
+* telegram: Fix regression in HTML handling (telegram). Closes #734
+* discord: Do not relay any bot messages (discord) (#743)
+* rocketchat: Do not send duplicate messages (rocketchat). Fixes #745 (#752)
+
+## Contributors
+This release couldn't exist without the following contributors:
+@Helcaraxan, @KrzysztofMadejski, @AJolly, @DeclanHoare
+
+# v1.13.1
+
+This release fixes go modules issues because of https://github.com/labstack/echo/issues/1272
+
+## Bugfix
+* general: fixes Unable to build 1.13.0 #698
+* api: move to labstack/echo/v4 fixes #698
+
+# v1.13.0
+
+## New features
+* general: refactors of telegram, irc, mattermost, matrix, discord, sshchat bridges and the gateway.
+* irc: Add option to send RAW commands after connection (irc) #490. See `RunCommands` in matterbridge.toml.sample
+* mattermost: 3.x support dropped
+* mattermost: Add support for mattermost threading (#627)
+* slack: Sync channel topics between Slack bridges #585. See `SyncTopic` in matterbridge.toml.sample
+* matrix: Add support for markdown to HTML conversion (matrix). Closes #663 (#670)
+* discord: Improve error reporting on failure to join Discord. Fixes #672 (#680)
+* discord: Use only one webhook if possible (discord) (#681)
+* discord: Allow to bridge non-bot Discord users (discord) (#689) If you prefix a token with `User ` it'll treat is as a user token.
+
+## Bugfix
+* slack: Try downloading files again if slack is too slow (slack). Closes #655 (#656)
+* slack: Ignore LatencyReport event (slack)
+* slack: Fix #668 strip lang in code fences sent to Slack (#673)
+* sshchat: Fix sshchat connection logic (#661)
+* sshchat: set quiet mode to filter joins/quits
+* sshchat: Trim newlines in the end of relayed messages
+* sshchat: fix media links
+* sshchat: do not relay "Rate limiting is in effect" message
+* mattermost: Fail if channel starts with hashtag (mattermost). Closes #625
+* discord: Add file comment to webhook messages (discord). Fixes #358
+* matrix: Fix displaying usernames for plain text clients. (matrix) (#685)
+* irc: Fix possible data race (irc). Closes #693
+* irc: Handle servers without MOTD (irc). Closes #692
+
+# v1.12.3
+## Bugfix
+* slack: Fix bot (legacy token) messages not being send. Closes #571
+* slack: Populate user on channel join (slack) (#644)
+* slack: Add wait option for populateUsers/Channels (slack) Fixes #579 (#653)
+
+# v1.12.2
+
+## Bugfix
+* irc: Fix multiple channel join regression. Closes #639
+* slack: Make slack-legacy change less restrictive (#626)
+
+# v1.12.1
+
+## Bugfix
+* discord: fix regression on server ID connection #619 #617
+* discord: Limit discord username via webhook to 32 chars
+* slack: Make sure threaded files stay in thread (slack). Fixes #590
+* slack: Do not post empty messages (slack). Fixes #574
+* slack: Handle deleted/edited thread starting messages (slack). Fixes #600 (#605)
+* irc: Rework connection logic (irc)
+* irc: Fix Nickserv logic (irc) #602
+
 # v1.12.0
 
 ## Breaking changes

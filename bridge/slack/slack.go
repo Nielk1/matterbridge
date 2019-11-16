@@ -12,7 +12,7 @@ import (
 	"github.com/42wim/matterbridge/bridge/config"
 	"github.com/42wim/matterbridge/bridge/helper"
 	"github.com/42wim/matterbridge/matterhook"
-	"github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/nlopes/slack"
 	"github.com/rs/xid"
 )
@@ -30,24 +30,18 @@ type Bslack struct {
 	uuid         string
 	useChannelID bool
 
-	users      map[string]*slack.User
-	usersMutex sync.RWMutex
-
-	channelsByID   map[string]*slack.Channel
-	channelsByName map[string]*slack.Channel
-	channelsMutex  sync.RWMutex
-
-	refreshInProgress      bool
-	earliestChannelRefresh time.Time
-	earliestUserRefresh    time.Time
-	refreshMutex           sync.Mutex
+	channels *channels
+	users    *users
+	legacy   bool
 }
 
 const (
+	sHello           = "hello"
 	sChannelJoin     = "channel_join"
 	sChannelLeave    = "channel_leave"
 	sChannelJoined   = "channel_joined"
 	sMemberJoined    = "member_joined_channel"
+	sMessageChanged  = "message_changed"
 	sMessageDeleted  = "message_deleted"
 	sSlackAttachment = "slack_attachment"
 	sPinnedItem      = "pinned_item"
@@ -76,14 +70,9 @@ func New(cfg *bridge.Config) bridge.Bridger {
 	// Print a deprecation warning for legacy non-bot tokens (#527).
 	token := cfg.GetString(tokenConfig)
 	if token != "" && !strings.HasPrefix(token, "xoxb") {
-		cfg.Log.Error("Non-bot token detected. It is STRONGLY recommended to use a proper bot-token instead.")
-		cfg.Log.Error("Legacy tokens may be deprecated by Slack at short notice. See the Matterbridge GitHub wiki for a migration guide.")
-		cfg.Log.Error("See https://github.com/42wim/matterbridge/wiki/Slack-bot-setup")
-		cfg.Log.Error("")
-		cfg.Log.Error("To continue using a legacy token please move your configuration to a \"slack-legacy\" bridge instead.")
-		cfg.Log.Error("See https://github.com/42wim/matterbridge/wiki/Section-Slack-(basic)#legacy-configuration)")
-		cfg.Log.Error("Delaying start of bridge by 30 seconds. Future Matterbridge release will fail here unless you use a \"slack-legacy\" bridge.")
-		time.Sleep(30 * time.Second)
+		cfg.Log.Warn("Non-bot token detected. It is STRONGLY recommended to use a proper bot-token instead.")
+		cfg.Log.Warn("Legacy tokens may be deprecated by Slack at short notice. See the Matterbridge GitHub wiki for a migration guide.")
+		cfg.Log.Warn("See https://github.com/42wim/matterbridge/wiki/Slack-bot-setup")
 		return NewLegacy(cfg)
 	}
 	return newBridge(cfg)
@@ -95,14 +84,9 @@ func newBridge(cfg *bridge.Config) *Bslack {
 		cfg.Log.Fatalf("Could not create LRU cache for Slack bridge: %v", err)
 	}
 	b := &Bslack{
-		Config:                 cfg,
-		uuid:                   xid.New().String(),
-		cache:                  newCache,
-		users:                  map[string]*slack.User{},
-		channelsByID:           map[string]*slack.Channel{},
-		channelsByName:         map[string]*slack.Channel{},
-		earliestChannelRefresh: time.Now(),
-		earliestUserRefresh:    time.Now(),
+		Config: cfg,
+		uuid:   xid.New().String(),
+		cache:  newCache,
 	}
 	return b
 }
@@ -122,7 +106,12 @@ func (b *Bslack) Connect() error {
 	// If we have a token we use the Slack websocket-based RTM for both sending and receiving.
 	if token := b.GetString(tokenConfig); token != "" {
 		b.Log.Info("Connecting using token")
-		b.sc = slack.New(token)
+
+		b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
+
+		b.channels = newChannelManager(b.Log, b.sc)
+		b.users = newUserManager(b.Log, b.sc)
+
 		b.rtm = b.sc.NewRTM()
 		go b.rtm.ManageConnection()
 		go b.handleSlack()
@@ -164,9 +153,21 @@ func (b *Bslack) JoinChannel(channel config.ChannelInfo) error {
 		return nil
 	}
 
-	b.populateChannels()
+	// try to join a channel when in legacy
+	if b.legacy {
+		_, err := b.sc.JoinChannel(channel.Name)
+		if err != nil {
+			switch err.Error() {
+			case "name_taken", "restricted_action":
+			case "default":
+				return err
+			}
+		}
+	}
 
-	channelInfo, err := b.getChannel(channel.Name)
+	b.channels.populateChannels(false)
+
+	channelInfo, err := b.channels.getChannel(channel.Name)
 	if err != nil {
 		return fmt.Errorf("could not join channel: %#v", err)
 	}
@@ -176,7 +177,8 @@ func (b *Bslack) JoinChannel(channel config.ChannelInfo) error {
 		channel.Name = channelInfo.Name
 	}
 
-	if !channelInfo.IsMember {
+	// we can't join a channel unless we are using legacy tokens #651
+	if !channelInfo.IsMember && !b.legacy {
 		return fmt.Errorf("slack integration that matterbridge is using is not member of channel '%s', please add it manually", channelInfo.Name)
 	}
 	return nil
@@ -192,6 +194,8 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 		b.Log.Debugf("=> Receiving %#v", msg)
 	}
 
+	msg.Text = b.replaceCodeFence(msg.Text)
+
 	// Make a action /me of the message
 	if msg.Event == config.EventUserAction {
 		msg.Text = "_" + msg.Text + "_"
@@ -199,16 +203,16 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 
 	// Use webhook to send the message
 	if b.GetString(outgoingWebhookConfig) != "" {
-		return b.sendWebhook(msg)
+		return "", b.sendWebhook(msg)
 	}
 	return b.sendRTM(msg)
 }
 
 // sendWebhook uses the configured WebhookURL to send the message
-func (b *Bslack) sendWebhook(msg config.Message) (string, error) {
+func (b *Bslack) sendWebhook(msg config.Message) error {
 	// Skip events.
 	if msg.Event != "" {
-		return "", nil
+		return nil
 	}
 
 	if b.GetBool(useNickPrefixConfig) {
@@ -263,13 +267,18 @@ func (b *Bslack) sendWebhook(msg config.Message) (string, error) {
 	}
 	if err := b.mh.Send(matterMessage); err != nil {
 		b.Log.Errorf("Failed to send message via webhook: %#v", err)
-		return "", err
+		return err
 	}
-	return "", nil
+	return nil
 }
 
 func (b *Bslack) sendRTM(msg config.Message) (string, error) {
-	channelInfo, err := b.getChannel(msg.Channel)
+	// Handle channelmember messages.
+	if handled := b.handleGetChannelMembers(&msg); handled {
+		return "", nil
+	}
+
+	channelInfo, err := b.channels.getChannel(msg.Channel)
 	if err != nil {
 		return "", fmt.Errorf("could not send message: %v", err)
 	}
@@ -280,8 +289,20 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 		return "", nil
 	}
 
-	// Handle message deletions.
 	var handled bool
+
+	// Handle topic/purpose updates.
+	if handled, err = b.handleTopicOrPurpose(&msg, channelInfo); handled {
+		return "", err
+	}
+
+	// Handle prefix hint for unthreaded messages.
+	if msg.ParentID == "msg-parent-not-found" {
+		msg.ParentID = ""
+		msg.Text = fmt.Sprintf("[thread]: %s", msg.Text)
+	}
+
+	// Handle message deletions.
 	if handled, err = b.deleteMessage(&msg, channelInfo); handled {
 		return msg.ID, err
 	}
@@ -296,12 +317,13 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 		return msg.ID, err
 	}
 
-	messageParameters := b.prepareMessageParameters(&msg)
-
 	// Upload a file if it exists.
 	if msg.Extra != nil {
-		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			_, _, err = b.rtm.PostMessage(channelInfo.ID, rmsg.Username+rmsg.Text, *messageParameters)
+		extraMsgs := helper.HandleExtra(&msg, b.General)
+		for i := range extraMsgs {
+			rmsg := &extraMsgs[i]
+			rmsg.Text = rmsg.Username + rmsg.Text
+			_, err = b.postMessage(rmsg, channelInfo)
 			if err != nil {
 				b.Log.Error(err)
 			}
@@ -311,7 +333,50 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	}
 
 	// Post message.
-	return b.postMessage(&msg, messageParameters, channelInfo)
+	return b.postMessage(&msg, channelInfo)
+}
+
+func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) error {
+	var updateFunc func(channelID string, value string) (*slack.Channel, error)
+
+	incomingChangeType, text := b.extractTopicOrPurpose(msg.Text)
+	switch incomingChangeType {
+	case "topic":
+		updateFunc = b.rtm.SetTopicOfConversation
+	case "purpose":
+		updateFunc = b.rtm.SetPurposeOfConversation
+	default:
+		b.Log.Errorf("Unhandled type received from extractTopicOrPurpose: %s", incomingChangeType)
+		return nil
+	}
+	for {
+		_, err := updateFunc(channelInfo.ID, text)
+		if err == nil {
+			return nil
+		}
+		if err = handleRateLimit(b.Log, err); err != nil {
+			return err
+		}
+	}
+}
+
+// handles updating topic/purpose and determining whether to further propagate update messages.
+func (b *Bslack) handleTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
+	if msg.Event != config.EventTopicChange {
+		return false, nil
+	}
+
+	if b.GetBool("SyncTopic") {
+		return true, b.updateTopicOrPurpose(msg, channelInfo)
+	}
+
+	// Pass along to normal message handlers.
+	if b.GetBool("ShowTopicChange") {
+		return false, nil
+	}
+
+	// Swallow message as handled no-op.
+	return true, nil
 }
 
 func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
@@ -330,7 +395,7 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 			return true, nil
 		}
 
-		if err = b.handleRateLimit(err); err != nil {
+		if err = handleRateLimit(b.Log, err); err != nil {
 			b.Log.Errorf("Failed to delete user message from Slack: %#v", err)
 			return true, err
 		}
@@ -341,28 +406,39 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	if msg.ID == "" {
 		return false, nil
 	}
-
+	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, _, _, err := b.rtm.UpdateMessage(channelInfo.ID, msg.ID, msg.Text)
+		messageOptions = append(messageOptions, slack.MsgOptionText(msg.Text, false))
+		_, _, _, err := b.rtm.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
 		if err == nil {
 			return true, nil
 		}
 
-		if err = b.handleRateLimit(err); err != nil {
+		if err = handleRateLimit(b.Log, err); err != nil {
 			b.Log.Errorf("Failed to edit user message on Slack: %#v", err)
 			return true, err
 		}
 	}
 }
 
-func (b *Bslack) postMessage(msg *config.Message, messageParameters *slack.PostMessageParameters, channelInfo *slack.Channel) (string, error) {
+func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
+	// don't post empty messages
+	if msg.Text == "" {
+		return "", nil
+	}
+	messageOptions := b.prepareMessageOptions(msg)
+	messageOptions = append(
+		messageOptions,
+		slack.MsgOptionText(msg.Text, false),
+		slack.MsgOptionEnableLinkUnfurl(),
+	)
 	for {
-		_, id, err := b.rtm.PostMessage(channelInfo.ID, msg.Text, *messageParameters)
+		_, id, err := b.rtm.PostMessage(channelInfo.ID, messageOptions...)
 		if err == nil {
 			return id, nil
 		}
 
-		if err = b.handleRateLimit(err); err != nil {
+		if err = handleRateLimit(b.Log, err); err != nil {
 			b.Log.Errorf("Failed to sent user message to Slack: %#v", err)
 			return "", err
 		}
@@ -385,11 +461,16 @@ func (b *Bslack) uploadFile(msg *config.Message, channelID string) {
 		ts := time.Now()
 		b.Log.Debugf("Adding file %s to cache at %s with timestamp", fi.Name, ts.String())
 		b.cache.Add("filename"+fi.Name, ts)
+		initialComment := fmt.Sprintf("File from %s", msg.Username)
+		if fi.Comment != "" {
+			initialComment += fmt.Sprintf("with comment: %s", fi.Comment)
+		}
 		res, err := b.sc.UploadFile(slack.FileUploadParameters{
-			Reader:         bytes.NewReader(*fi.Data),
-			Filename:       fi.Name,
-			Channels:       []string{channelID},
-			InitialComment: fi.Comment,
+			Reader:          bytes.NewReader(*fi.Data),
+			Filename:        fi.Name,
+			Channels:        []string{channelID},
+			InitialComment:  initialComment,
+			ThreadTimestamp: msg.ParentID,
 		})
 		if err != nil {
 			b.Log.Errorf("uploadfile %#v", err)
@@ -402,7 +483,7 @@ func (b *Bslack) uploadFile(msg *config.Message, channelID string) {
 	}
 }
 
-func (b *Bslack) prepareMessageParameters(msg *config.Message) *slack.PostMessageParameters {
+func (b *Bslack) prepareMessageOptions(msg *config.Message) []slack.MsgOption {
 	params := slack.NewPostMessageParameters()
 	if b.GetBool(useNickPrefixConfig) {
 		params.AsUser = true
@@ -414,17 +495,23 @@ func (b *Bslack) prepareMessageParameters(msg *config.Message) *slack.PostMessag
 	if msg.Avatar != "" {
 		params.IconURL = msg.Avatar
 	}
+
+	var attachments []slack.Attachment
 	// add a callback ID so we can see we created it
-	params.Attachments = append(params.Attachments, slack.Attachment{CallbackID: "matterbridge_" + b.uuid})
+	attachments = append(attachments, slack.Attachment{CallbackID: "matterbridge_" + b.uuid})
 	// add file attachments
-	params.Attachments = append(params.Attachments, b.createAttach(msg.Extra)...)
+	attachments = append(attachments, b.createAttach(msg.Extra)...)
 	// add slack attachments (from another slack bridge)
 	if msg.Extra != nil {
 		for _, attach := range msg.Extra[sSlackAttachment] {
-			params.Attachments = append(params.Attachments, attach.([]slack.Attachment)...)
+			attachments = append(attachments, attach.([]slack.Attachment)...)
 		}
 	}
-	return &params
+
+	var opts []slack.MsgOption
+	opts = append(opts, slack.MsgOptionAttachments(attachments...))
+	opts = append(opts, slack.MsgOptionPostMessageParameters(params))
+	return opts
 }
 
 func (b *Bslack) createAttach(extra map[string][]interface{}) []slack.Attachment {

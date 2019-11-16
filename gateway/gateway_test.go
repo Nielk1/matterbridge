@@ -2,20 +2,28 @@ package gateway
 
 import (
 	"fmt"
+	"io/ioutil"
 	"strconv"
+	"testing"
 
 	"github.com/42wim/matterbridge/bridge/config"
+	"github.com/42wim/matterbridge/gateway/bridgemap"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-
-	"testing"
+	"github.com/stretchr/testify/suite"
 )
 
 var testconfig = []byte(`
 [irc.freenode]
+server=""
 [mattermost.test]
+server=""
 [gitter.42wim]
+server=""
 [discord.test]
+server=""
 [slack.test]
+server=""
 
 [[gateway]]
     name = "bridge1"
@@ -41,10 +49,15 @@ var testconfig = []byte(`
 
 var testconfig2 = []byte(`
 [irc.freenode]
+server=""
 [mattermost.test]
+server=""
 [gitter.42wim]
+server=""
 [discord.test]
+server=""
 [slack.test]
+server=""
 
 [[gateway]]
     name = "bridge1"
@@ -84,8 +97,11 @@ var testconfig2 = []byte(`
 
 var testconfig3 = []byte(`
 [irc.zzz]
+server=""
 [telegram.zzz]
+server=""
 [slack.zzz]
+server=""
 [[gateway]]
 name="bridge"
 enable=true
@@ -159,8 +175,10 @@ const (
 )
 
 func maketestRouter(input []byte) *Router {
-	cfg := config.NewConfigFromString(input)
-	r, err := NewRouter(cfg)
+	logger := logrus.New()
+	logger.SetOutput(ioutil.Discard)
+	cfg := config.NewConfigFromString(logger, input)
+	r, err := NewRouter(logger, cfg, bridgemap.FullMap)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -171,7 +189,6 @@ func TestNewRouter(t *testing.T) {
 	assert.Equal(t, 1, len(r.Gateways))
 	assert.Equal(t, 4, len(r.Gateways["bridge1"].Bridges))
 	assert.Equal(t, 4, len(r.Gateways["bridge1"].Channels))
-
 	r = maketestRouter(testconfig2)
 	assert.Equal(t, 2, len(r.Gateways))
 	assert.Equal(t, 4, len(r.Gateways["bridge1"].Bridges))
@@ -385,4 +402,140 @@ func TestGetDestChannelAdvanced(t *testing.T) {
 		}
 	}
 	assert.Equal(t, map[string]int{"bridge3": 4, "bridge": 9, "announcements": 3, "bridge2": 4}, hits)
+}
+
+type ignoreTestSuite struct {
+	suite.Suite
+
+	gw *Gateway
+}
+
+func TestIgnoreSuite(t *testing.T) {
+	s := &ignoreTestSuite{}
+	suite.Run(t, s)
+}
+
+func (s *ignoreTestSuite) SetupSuite() {
+	logger := logrus.New()
+	logger.SetOutput(ioutil.Discard)
+	s.gw = &Gateway{logger: logrus.NewEntry(logger)}
+}
+func (s *ignoreTestSuite) TestIgnoreTextEmpty() {
+	extraFile := make(map[string][]interface{})
+	extraAttach := make(map[string][]interface{})
+	extraFailure := make(map[string][]interface{})
+	extraFile["file"] = append(extraFile["file"], config.FileInfo{})
+	extraAttach["attachments"] = append(extraAttach["attachments"], []string{})
+	extraFailure[config.EventFileFailureSize] = append(extraFailure[config.EventFileFailureSize], config.FileInfo{})
+
+	msgTests := map[string]struct {
+		input  *config.Message
+		output bool
+	}{
+		"usertyping": {
+			input:  &config.Message{Event: config.EventUserTyping},
+			output: false,
+		},
+		"file attach": {
+			input:  &config.Message{Extra: extraFile},
+			output: false,
+		},
+		"attachments": {
+			input:  &config.Message{Extra: extraAttach},
+			output: false,
+		},
+		config.EventFileFailureSize: {
+			input:  &config.Message{Extra: extraFailure},
+			output: false,
+		},
+		"nil extra": {
+			input:  &config.Message{Extra: nil},
+			output: true,
+		},
+		"empty": {
+			input:  &config.Message{},
+			output: true,
+		},
+	}
+	for testname, testcase := range msgTests {
+		output := s.gw.ignoreTextEmpty(testcase.input)
+		s.Assert().Equalf(testcase.output, output, "case '%s' failed", testname)
+	}
+
+}
+
+func (s *ignoreTestSuite) TestIgnoreTexts() {
+	msgTests := map[string]struct {
+		input  string
+		re     []string
+		output bool
+	}{
+		"no regex": {
+			input:  "a text message",
+			re:     []string{},
+			output: false,
+		},
+		"simple regex": {
+			input:  "a text message",
+			re:     []string{"text"},
+			output: true,
+		},
+		"multiple regex fail": {
+			input:  "a text message",
+			re:     []string{"abc", "123$"},
+			output: false,
+		},
+		"multiple regex pass": {
+			input:  "a text message",
+			re:     []string{"lala", "sage$"},
+			output: true,
+		},
+	}
+	for testname, testcase := range msgTests {
+		output := s.gw.ignoreText(testcase.input, testcase.re)
+		s.Assert().Equalf(testcase.output, output, "case '%s' failed", testname)
+	}
+}
+
+func (s *ignoreTestSuite) TestIgnoreNicks() {
+	msgTests := map[string]struct {
+		input  string
+		re     []string
+		output bool
+	}{
+		"no entry": {
+			input:  "user",
+			re:     []string{},
+			output: false,
+		},
+		"one entry": {
+			input:  "user",
+			re:     []string{"user"},
+			output: true,
+		},
+		"multiple entries": {
+			input:  "user",
+			re:     []string{"abc", "user"},
+			output: true,
+		},
+		"multiple entries fail": {
+			input:  "user",
+			re:     []string{"abc", "def"},
+			output: false,
+		},
+	}
+	for testname, testcase := range msgTests {
+		output := s.gw.ignoreText(testcase.input, testcase.re)
+		s.Assert().Equalf(testcase.output, output, "case '%s' failed", testname)
+	}
+}
+
+func BenchmarkTengo(b *testing.B) {
+	msg := &config.Message{Username: "user", Text: "blah testing", Account: "protocol.account", Channel: "mychannel"}
+	for n := 0; n < b.N; n++ {
+		err := modifyMessageTengo("bench.tengo", msg)
+		if err != nil {
+			return
+		}
+	}
 }
